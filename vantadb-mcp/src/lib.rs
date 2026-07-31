@@ -73,13 +73,31 @@ impl McpConfig {
     }
 }
 
-/// Centralized Iron Axioms definition (Devil's Advocate rules).
-const AXIOMS: &str = r#"[
+/// Well-known namespace for system-level metadata storage.
+const SYSTEM_NAMESPACE: &str = "_system";
+
+/// Key under which axioms are stored in the system namespace.
+const AXIOMS_STORAGE_KEY: &str = "axioms";
+
+/// Hardcoded Iron Axioms definition (Devil's Advocate rules) — fallback
+/// when no stored axioms exist in the metadata storage.
+const HARDCODED_AXIOMS: &str = r#"[
     {"id":1,"name":"Topological Axiom","description":"References (edges) to orphan nodes or nodes in Tombstone storage are not allowed."},
     {"id":2,"name":"Confidence Constraint","description":"Divergent vector mutations with high historical Confidence Score are rejected."},
     {"id":3,"name":"Immortal Axiom","description":"Maintenance: Nodes marked as PINNED evade degradation by Data Decay."},
     {"id":4,"name":"Resource Allocation","description":"Maintenance: 5% of memory reserved for nodes with semantic priority >= 0.8."}
 ]"#;
+
+/// Resolve active axioms, preferring stored metadata over hardcoded defaults.
+fn resolve_axioms(storage: &Arc<StorageEngine>) -> Value {
+    let embedded = vantadb::VantaEmbedded::from_engine(storage.clone());
+    match embedded.get(SYSTEM_NAMESPACE, AXIOMS_STORAGE_KEY) {
+        Ok(Some(record)) => serde_json::from_str(&record.payload).unwrap_or_else(|_| {
+            serde_json::from_str(HARDCODED_AXIOMS).unwrap_or_else(|_| json!([]))
+        }),
+        _ => serde_json::from_str(HARDCODED_AXIOMS).unwrap_or_else(|_| json!([])),
+    }
+}
 
 // ── Error type ─────────────────────────────────────────────────────────────
 
@@ -296,7 +314,9 @@ fn collect_all_records(
         let options = vantadb::sdk::VantaMemoryListOptions {
             limit: config.max_list_limit,
             cursor,
+            #[allow(deprecated)]
             filters: vantadb::sdk::VantaMemoryMetadata::new(),
+            filter_ops: None,
         };
         match embedded.list(namespace, options) {
             Ok(page) => {
@@ -336,6 +356,21 @@ pub async fn run_stdio_server(storage: Arc<StorageEngine>) {
         if tokio::signal::ctrl_c().await.is_ok() {
             info!("Received SIGINT, initiating graceful shutdown");
             sig_running.store(false, Ordering::SeqCst);
+        }
+    });
+
+    // Periodic metrics logging (every 30 s) — makes active_requests observable at runtime.
+    let metrics_logger = metrics.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(30));
+        loop {
+            interval.tick().await;
+            info!(
+                active = metrics_logger.active_requests.load(Ordering::Relaxed),
+                total = metrics_logger.requests_total.load(Ordering::Relaxed),
+                errors = metrics_logger.errors_total.load(Ordering::Relaxed),
+                "MCP server metrics",
+            );
         }
     });
 
@@ -420,12 +455,19 @@ pub async fn run_stdio_server(storage: Arc<StorageEngine>) {
             break;
         }
 
-        if let Ok(out) = serde_json::to_string(&response) {
-            let _ = stdout.write_all(out.as_bytes()).await;
-            let _ = stdout.write_all(b"\n").await;
-            let _ = stdout.flush().await;
-        } else {
-            error!("Failed to serialize JSON-RPC response body");
+        match serde_json::to_string(&response) {
+            Ok(out) => {
+                if let Err(e) = stdout.write_all(out.as_bytes()).await {
+                    error!(error = %e, "Failed to write response to stdout");
+                } else if let Err(e) = stdout.write_all(b"\n").await {
+                    error!(error = %e, "Failed to write newline to stdout");
+                } else if let Err(e) = stdout.flush().await {
+                    error!(error = %e, "Failed to flush stdout");
+                }
+            }
+            Err(e) => {
+                error!(error = %e, "Failed to serialize JSON-RPC response body");
+            }
         }
     }
 
@@ -436,12 +478,21 @@ pub async fn run_stdio_server(storage: Arc<StorageEngine>) {
     );
 }
 
-/// Write a JSON value to stdout, swallowing I/O errors.
+/// Write a JSON value to stdout, logging I/O errors instead of swallowing them.
 async fn write_json(stdout: &mut tokio::io::Stdout, value: &Value) {
-    if let Ok(out) = serde_json::to_string(value) {
-        let _ = stdout.write_all(out.as_bytes()).await;
-        let _ = stdout.write_all(b"\n").await;
-        let _ = stdout.flush().await;
+    match serde_json::to_string(value) {
+        Ok(out) => {
+            if let Err(e) = stdout.write_all(out.as_bytes()).await {
+                error!(error = %e, "write_json: failed to write to stdout");
+            } else if let Err(e) = stdout.write_all(b"\n").await {
+                error!(error = %e, "write_json: failed to write newline to stdout");
+            } else if let Err(e) = stdout.flush().await {
+                error!(error = %e, "write_json: failed to flush stdout");
+            }
+        }
+        Err(e) => {
+            error!(error = %e, "write_json: serialization failed");
+        }
     }
 }
 
@@ -629,7 +680,9 @@ pub fn handle_resources_read(
         let options = vantadb::sdk::VantaMemoryListOptions {
             limit: 100,
             cursor: None,
+            #[allow(deprecated)]
             filters: vantadb::sdk::VantaMemoryMetadata::new(),
+            filter_ops: None,
         };
         match embedded.list(namespace, options) {
             Ok(page) => {
@@ -894,6 +947,17 @@ pub fn handle_tools_list() -> Result<Value, Value> {
                     },
                     "required": ["namespace", "confirm"]
                 }
+            },
+            {
+                "name": "rehydrate",
+                "description": "Recover shadow-archived nodes that belonged to a summary node from TombstoneStorage.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "summary_id": { "type": "string", "description": "Summary node ID (u128 as string) whose archived nodes to recover" }
+                    },
+                    "required": ["summary_id"]
+                }
             }
         ]
     }))
@@ -1022,7 +1086,9 @@ pub fn handle_tools_call(
             let options = vantadb::sdk::VantaMemoryListOptions {
                 limit,
                 cursor,
+                #[allow(deprecated)]
                 filters,
+                filter_ops: None,
             };
 
             let embedded = vantadb::VantaEmbedded::from_engine(storage.clone());
@@ -1048,6 +1114,15 @@ pub fn handle_tools_call(
                 .as_str()
                 .ok_or_else(|| McpError::invalid_params("Missing 'query'").to_json())?;
 
+            let trimmed = query.trim();
+            if trimmed.is_empty() {
+                return Ok(error_content("Query cannot be empty"));
+            }
+
+            if query.contains('\0') {
+                return Ok(error_content("Query contains invalid null bytes"));
+            }
+
             if query.len() > config.max_query_length {
                 return Ok(error_content(format!(
                     "Query exceeds maximum length of {} bytes",
@@ -1055,10 +1130,12 @@ pub fn handle_tools_call(
                 )));
             }
 
-            match executor.execute_hybrid(query) {
+            match executor.execute_hybrid(trimmed) {
                 Ok(ExecutionResult::Read(nodes)) => {
-                    let records: Vec<vantadb::sdk::VantaNodeRecord> =
-                        nodes.into_iter().map(Into::into).collect();
+                    let records: Vec<vantadb::sdk::VantaNodeRecord> = nodes
+                        .into_iter()
+                        .map(|n| storage.node_to_record(n))
+                        .collect();
                     Ok(text_content(serialize_content(&records)))
                 }
                 Ok(ExecutionResult::Write {
@@ -1242,10 +1319,7 @@ pub fn handle_tools_call(
             }
         }
 
-        "read_axioms" => {
-            let axioms: Value = serde_json::from_str(AXIOMS).unwrap_or_else(|_| json!([]));
-            Ok(text_content(serialize_content(&axioms)))
-        }
+        "read_axioms" => Ok(text_content(serialize_content(&resolve_axioms(storage)))),
 
         "collection_stats" => {
             let namespace = args["namespace"]
@@ -1316,6 +1390,24 @@ pub fn handle_tools_call(
             Ok(text_content(serialize_content(&collections)))
         }
 
+        "rehydrate" => {
+            let summary_id = args["summary_id"]
+                .as_str()
+                .ok_or_else(|| McpError::invalid_params("Missing 'summary_id'").to_json())?;
+            let sid: u128 = summary_id.parse().map_err(|_| {
+                McpError::invalid_params("summary_id must be a valid integer (u128)").to_json()
+            })?;
+            let embedded = vantadb::VantaEmbedded::from_engine(storage.clone());
+            let recovered = embedded
+                .recover_archived_nodes(sid)
+                .map_err(|e| McpError::internal_error(e.to_string()).to_json())?;
+            Ok(text_content(serialize_content(&json!({
+                "recovered_count": recovered.len(),
+                "summary_id": summary_id,
+                "rehydration_complete": true,
+            }))))
+        }
+
         "collection_delete" => {
             let namespace = args["namespace"]
                 .as_str()
@@ -1341,7 +1433,9 @@ pub fn handle_tools_call(
             let records = match collect_all_records(&embedded, namespace, config) {
                 Ok(r) => r,
                 Err(e) => {
-                    let _ = storage.commit_transaction(txn_id);
+                    if let Err(abort_err) = storage.abort_transaction(txn_id) {
+                        warn!(error = %abort_err, "Failed to abort transaction after collection error");
+                    }
                     return Ok(error_content(format!("Collection delete error: {}", e)));
                 }
             };
@@ -1358,22 +1452,25 @@ pub fn handle_tools_call(
                 }
             }
 
+            if failures > 0 {
+                if let Err(abort_err) = storage.abort_transaction(txn_id) {
+                    warn!(error = %abort_err, "Failed to abort transaction after partial delete");
+                }
+                return Ok(error_content(format!(
+                    "Partial delete: {}/{} removed, last error: {}",
+                    total - failures,
+                    total,
+                    last_error
+                )));
+            }
+
             storage.commit_transaction(txn_id).map_err(|e| {
                 McpError::internal_error(format!("Failed to commit transaction: {}", e)).to_json()
             })?;
 
-            let records_removed = total - failures;
-
-            if failures > 0 {
-                return Ok(error_content(format!(
-                    "Partial delete: {}/{} removed, last error: {}",
-                    records_removed, total, last_error
-                )));
-            }
-
             let result = json!({
                 "deleted": true,
-                "records_removed": records_removed,
+                "records_removed": records.len(),
             });
             Ok(text_content(serialize_content(&result)))
         }

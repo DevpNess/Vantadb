@@ -1,3 +1,11 @@
+---
+title: "Server Configuration"
+type: discord
+status: active
+tags: [vantadb, discord]
+last_reviewed: 2026-07-21
+---
+
 # Server Configuration
 
 ## Categories & Channels
@@ -23,6 +31,11 @@
 | #🐛bug-reports | Forum | Bug reports |
 | #💻dev-chat | Text | Technical development discussion |
 | #💡ideas | Forum | Feature suggestions |
+
+### 🎤 EVENTS (all members)
+| Channel | Type | Topic |
+|---|---|---|
+| #🎤 Stage | Voice | AMAs, presentations, community events |
 
 ### 🛡️ STAFF (Admin only)
 | Channel | Type |
@@ -64,7 +77,7 @@
 
 ## Permission Architecture
 
-All categories grant ViewChannel + SendMessages to @everyone (no EN/ES separation — single-channel bilingual model). Only STAFF category is restricted to Admin role.
+All categories grant ViewChannel + SendMessages to @everyone. **Single-channel bilingual model** — English and Spanish coexist in the same channels, language roles are cosmetic/identity only. Only STAFF category is restricted to Admin role.
 
 ## Server Settings
 

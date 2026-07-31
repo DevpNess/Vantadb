@@ -700,9 +700,9 @@ Items evaluados y decididos como no resolver:
 - NUEVO-10 ✅ benchmark suite ya existe con perf-bench-40.yml y resultados
 - NUEVO-20 ✅ Dockerfile multi-stage ya existe
 - TSK-106 ❌ SKIP (GitHub Discussions requiere humano)
-- NUEVO-01 ✅ benchmarks ya en README
+- NUEVO-01 ❌ RESET — Página web cambió, README hero reemplazado. Tarea desde cero en backlog.
 - NUEVO-07 ✅ migration scripts en `vantadb_py/migrate/`
-- MKT-14 ✅ scaffold de `/case-studies`
+- MKT-14 ❌ RESET — Página web cambió, case studies a rediseñar desde cero. Tarea en backlog.
 - TSK-107 ✅ scaffold de `/showcase`
 - Resto: learning path (NUEVO-08) o feature work (ACID Phase 2-3, PQ, LSM, sparse vectors, HNSW PID, enterprise crate, pooling)
 
@@ -739,6 +739,10 @@ Items evaluados y decididos como no resolver:
 - **VFY-002**: TS SDK no tiene `get_nns_by_id`; `search()`/`searchVector()` son llamadas directas, sin spawn batching issue.
 - **VFY-005**: `OperationalMetrics` en `types.ts` ya tiene 21 campos, no "3/10".
 - **NUEVO-19**: `SourceDesign/` no existe en el repo.
+
+### 2026-07-27 — COMP-013: Segment Optimizer Pipeline completado
+
+**Qué se hizo:** Verificación de COMP-013. El pipeline Segment Optimizer (Vacuum/Merge/Index) ya estaba implementado con `vacuum()`, `merge_segments()`, `run_pipeline()`, tipos `PipelineMode/VacuumReport/MergeReport/PipelineReport`, `SegmentOptimizerConfig` en `VantaConfig`, y SDK API completa. 77 tests de maintenance pasando. Backlog actualizado y migrado a progreso.
 
 ## Archivos Fuente de Referencia
 

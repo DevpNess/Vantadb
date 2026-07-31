@@ -1,12 +1,19 @@
 ---
 name: vantadb-certify
 description: >
-  Pre-push certification gate for VantaDB. Runs ALL verification layers
-  sequentially: Rust compile/lint/test → Python SDK → Web → TypeScript SDK
-  → docs → audit + skill-based code review. Must pass 100% before pushing.
+  [DEPRECATED] Pre-push certification gate for VantaDB. Replaced by
+  unified-review --mode certify --profile vantadb. This file kept only
+  for git history — do not load or invoke.
+status: deprecated
+superseded_by: unified-review
 ---
 
-# VantaDB Certification Gate
+# ⚠️ DEPRECATED — Replaced by unified-review
+
+> **Do not use.** This skill is superseded by `skill unified-review --mode certify --profile vantadb`.
+> Kept only for git history. No active references remain.
+
+# VantaDB Certification Gate (Legacy)
 
 Certificación completa pre-push. El pipeline entero (CI) debe pasar localmente.
 
@@ -49,7 +56,7 @@ Si el diff contiene `unsafe` → además:
 | Build + test | `pwsh dev-tools/setup_venv.ps1 && pwsh dev-tools/scripts/validate_python_sdk.ps1` |
 | Integration tests | Cargar `doubt-driven-development` y verificar tests de adapters tocados |
 
-### Layer 3: Web Frontend
+### Layer 3: Web Frontend (Next.js)
 
 Corresponde a `.github/workflows/ci-web-11.yml`.
 
@@ -58,7 +65,7 @@ cd web
 npm ci --ignore-scripts
 npm run lint          # 0 errors, 0 warnings
 npx tsc --noEmit      # 0 errors
-npm run build         # build exitoso
+npm run build         # next build exitoso
 cd ..
 ```
 

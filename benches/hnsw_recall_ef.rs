@@ -12,7 +12,9 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use std::hint::black_box;
 use std::time::Instant;
-use vantadb::index::{cosine_sim_f32, CPIndex, HnswConfig, VectorRepresentations};
+use vantadb::index::{
+    auto_tune::AutoTune, cosine_sim_f32, CPIndex, HnswConfig, IndexType, VectorRepresentations,
+};
 use vantadb::node::DistanceMetric;
 use vantadb::node::FilterBitset;
 
@@ -96,11 +98,13 @@ fn bench_hnsw_recall_ef(c: &mut Criterion) {
     let base_config = HnswConfig {
         m: 16,
         m_max0: 32,
-        ef_construction: 200,
-        ef_search: 200,
+        ef_construction: 100,
+        ef_search: 100,
         ml: 1.0 / (16_f64).ln(),
         distance_metric: DistanceMetric::Cosine,
-        flat_threshold: Some(10000),
+        flat_threshold: None, // None = force real HNSW search
+        index_type: IndexType::Hnsw,
+        auto_tune: false,
     };
 
     let raw_vectors = generate_vectors(N_VECTORS, DIMS, SEED);
@@ -111,7 +115,40 @@ fn bench_hnsw_recall_ef(c: &mut Criterion) {
         .collect();
     let queries = generate_vectors(N_QUERIES, DIMS, SEED + 1000);
 
-    // Build index (measured)
+    // ── 1. ef_construction Sweep (Build Time vs Recall@10) ─────────────
+    println!(
+        "\n━━━ HNSW ef_construction Trade-Off Sweep (N={}, D={}) ━━━",
+        N_VECTORS, DIMS
+    );
+    println!(
+        "  {:<16} {:<16} {:<16}",
+        "ef_construction", "Build Time (s)", "Recall@10 (ef_s=100)"
+    );
+    println!("  {}", "─".repeat(50));
+
+    for &ef_c in &[50usize, 100, 200, 400] {
+        let cfg = HnswConfig {
+            ef_construction: ef_c,
+            ef_search: 100,
+            ..base_config.clone()
+        };
+        let index = CPIndex::new_with_config(cfg);
+        let t0 = Instant::now();
+        for (id, vec) in &dataset {
+            index.add(
+                *id,
+                FilterBitset::all_set(),
+                VectorRepresentations::Full(vec.clone()),
+                0,
+            );
+        }
+        let build_s = t0.elapsed().as_secs_f64();
+        let recall = compute_recall(&index, &queries, &dataset, TOP_K);
+        println!("  {:<16} {:<16.3} {:<16.4}", ef_c, build_s, recall);
+    }
+    println!("  {}", "─".repeat(50));
+
+    // Build index for ef_search sweep (using default ef_construction = 100)
     let build_time = {
         let index = CPIndex::new_with_config(base_config.clone());
         let t0 = Instant::now();
@@ -123,14 +160,7 @@ fn bench_hnsw_recall_ef(c: &mut Criterion) {
                 0,
             );
         }
-        let elapsed = t0.elapsed();
-        println!(
-            "\n  Build time (N={}, D={}): {:.3}s",
-            N_VECTORS,
-            DIMS,
-            elapsed.as_secs_f64()
-        );
-        elapsed
+        t0.elapsed()
     };
 
     group.bench_function("build_index", |b| {
@@ -157,6 +187,10 @@ fn bench_hnsw_recall_ef(c: &mut Criterion) {
     let mut results: Vec<(usize, f64, f64, f64, f64, f64)> = Vec::new();
 
     for &ef in EF_SWEEP {
+        // Bypass the global auto_tuner so search uses the configured static ef
+        // only (mirrors benches/param_sweep.rs). Without this, tuned_ef could
+        // exceed ef_search, contaminating the ef sweep.
+        AutoTune::set_ef(1);
         let index = CPIndex::new_with_config(HnswConfig {
             ef_search: ef,
             ..base_config.clone()

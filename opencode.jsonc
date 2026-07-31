@@ -1,8 +1,13 @@
 {
   "$schema": "https://opencode.ai/config.json",
+  "model": "deepseek-v4-flash-free",
+  "small_model": "deepseek-v4-flash-free",
   "plugin": [
     "C:\\Users\\Eros\\.agents\\ponytail\\.opencode\\plugins\\ponytail.mjs"
   ],
+  "experimental": {
+    "disable_paste_summary": true
+  },
   "mcp": {
     "codegraph": {
       "type": "local",
@@ -19,7 +24,7 @@
         "pwsh",
         "-NoProfile",
         "-Command",
-        "$t = (Get-Content '.env.tokens' | Where-Object {$_ -match '^DISCORD_BOT_TOKEN=\"(.+)\"$'} | ForEach-Object {$Matches[1]}); $env:DISCORD_TOKEN = $t; npx --yes @rayenking/discord-mcp"
+        "$t = (Get-Content '.env.tokens' | Where-Object {$_ -match '^DISCORD_BOT_TOKEN=\"(.+)\"$'} | ForEach-Object {$Matches[1]}); $env:DISCORD_TOKEN = $t; bunx @rayenking/discord-mcp"
       ],
       "enabled": true
     },
@@ -43,12 +48,21 @@
     },
     "campaign": {
       "command": [
-        "node",
+        "bun",
         ".opencode/task-system/mcp/campaign-server.mjs"
       ],
       "enabled": true,
       "type": "local",
       "description": "Plan de campaña: get_next_task, update_task_state, verify_cmd."
+    },
+    "lottiefiles-creator": {
+      "command": [
+        "bunx",
+        "@lottiefiles/creator-mcp@latest"
+      ],
+      "enabled": true,
+      "type": "local",
+      "description": "LottieFiles Creator MCP — crear y editar animaciones Lottie via IA."
     }
   }
 }

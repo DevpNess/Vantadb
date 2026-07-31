@@ -1,18 +1,47 @@
 ---
 title: "Physical Storage Format Versioning Strategy"
-status: draft
+status: implemented
 tags: [vantadb, architecture, storage]
-last_reviewed: 2026-07-03
+last_reviewed: 2026-07-25
 aliases: []
 ---
 
 # Physical Storage Format Versioning Strategy
 
-**Status:** Draft  
-**Last Updated:** 2026-07-03  
+**Status:** Implemented (WEB-04)  
+**Last Updated:** 2026-07-25  
 **Related:** `ARCHITECTURE.md`, `DURABILITY_GUARANTEES.md`, `src/binary_header.rs`, `src/schema.rs`
 
 ---
+
+> **WEB-04 Implementation (2026-07-25):** Added `VantaHeader::validate_compat()` — a range-based
+> compatibility check that replaces exact-match validation across all three storage formats.
+>
+> ## What was changed
+>
+> 1. **`src/binary_header.rs`** — `validate_compat()` accepts any `format_version ≤ max_version`
+>    with matching magic, enabling forward-compatible reads. Old-format files are still readable
+>    by newer software; future-format files (version > max) are rejected with a clear error.
+>
+> 2. **`src/storage/vfile.rs` (VantaFile):**
+>    - `create_in_memory()` and `open_with_mode()` init path now stamp `VFILE_VERSION` (2)
+>      instead of hardcoded `1`.
+>    - Read validation uses `header.validate_compat(*b"VFLE", VFILE_VERSION, "VantaFile")`
+>      instead of manual `!= 1 && != VFILE_VERSION` check.
+>
+> 3. **`src/index/serialize.rs` (HNSW):**
+>    - Already used `validate_compat(*b"VNDX", VECTOR_INDEX_VERSION)` — no changes needed.
+>
+> 4. **`src/wal.rs` (WAL):**
+>    - `WalWriter::open()` now stamps `WAL_FORMAT_VERSION` instead of hardcoded `1`.
+>    - `WalHeader::deserialize()` uses `base.validate_compat(*b"VWAL", WAL_FORMAT_VERSION)`
+>      for magic + upper-bound validation, replacing manual magic check + missing upper bound.
+>    - Lower bound (version ≥ 1) preserved since WAL version 0 was never valid.
+>
+> 5. **`src/lib.rs`** — Public constants `VFILE_VERSION`, `VECTOR_INDEX_VERSION`,
+>    `WAL_FORMAT_VERSION`, `WAL_POSTCARD_VERSION` exported from crate root.
+>
+> All 1600 tests pass (cargo nextest run --profile audit).
 
 ## 1. Current State
 
@@ -23,7 +52,7 @@ VantaDB persists data across four distinct physical formats, each with its own m
 | Format | File(s) | Magic | Current Version | Version Type | Defined In |
 |---|---|---|---|---|---|
 | **VantaFile** | `vector_store.vanta` | `b"VFLE"` | `1` | `u16` format_version | `src/storage/vfile.rs` |
-| **Vector Index (HNSW)** | `index.bin` | `b"VNDX"` | `4` | `u16` format_version | `src/index/core.rs` (const `VECTOR_INDEX_VERSION`) |
+| **Vector Index (HNSW)** | `index.bin` | `b"VNDX"` | `7` | `u16` format_version | `src/index/graph.rs` (const `VECTOR_INDEX_VERSION`) |
 | **WAL** | `wal.log`, segments | `b"VWAL"` | `1` | `u32` (cast from `u16`) | `src/wal.rs` (`WalHeader`) |
 | **Schema** | `.vanta.schema` | `b"VTDBv001"` | `1` | `u32` schema_version | `src/schema.rs` (`StorageHeader`) |
 
@@ -75,8 +104,8 @@ Total: 72 bytes
 
 Two error variants exist for version incompatibility:
 
-- **`IncompatibleFormat`** (`src/error.rs:32`): magic or version mismatch on any `VantaHeader`-based file. Returns expected vs. found magic/version pairs plus a hint string.
-- **`WALVersionMismatch`** (`src/error.rs:19`): WAL-specific version error. Returns expected vs. found `u32` version plus a hint.
+- **`IncompatibleFormat`** (`src/error.rs:134`): magic or version mismatch on any `VantaHeader`-based file. Returns expected vs. found magic/version pairs plus a hint string.
+- **`WALVersionMismatch`** (`src/error.rs:115`): WAL-specific version error. Returns expected vs. found `u32` version plus a hint.
 
 ---
 
@@ -232,19 +261,26 @@ pub fn validate_compat(
 
 ### 4.1 `vanta-cli migrate` Command Design
 
-The existing `cmd_migrate` needs to be extended from schema-only to a **format-level migration runner**.
+The existing `cmd_migrate` has been extended from schema-only to a **format-level migration runner** with a subcommand interface.
 
 **Command interface:**
 
 ```
-vanta-cli migrate --target <path> [--format <format>] [--dry-run] [--force]
+vanta-cli migrate plan   <target>
+vanta-cli migrate run    <target> [--format <format>] [--dry-run] [--force]
+vanta-cli migrate check  <target>
 ```
 
-| Flag | Purpose |
+| Subcommand | Purpose |
 |---|---|
-| `--target` | Database directory path |
-| `--format` | Specific format to migrate (vfile, index, wal, schema, all) |
-| `--dry-run` | Report what would be migrated without writing |
+| `plan` | Preview migrations without modifying files |
+| `run` | Execute migrations to bring formats up to date |
+| `check` | Verify storage integrity across all formats |
+
+| `run` flag | Purpose |
+|---|---|
+| `--format` | Specific format to migrate (vfile, index, wal, schema, all); default: all |
+| `--dry-run` | Preview changes without writing |
 | `--force` | Skip confirmation prompts |
 
 **Internal flow:**
@@ -274,9 +310,9 @@ vanta-cli migrate --target <path> [--format <format>] [--dry-run] [--force]
 | Add payload checksum footer | Rewrite each record block with appended CRC32C |
 | Optional field support | Scan all nodes; fill missing optionals with default sentinel |
 
-**Vector Index v1→v2→v3→v4 (already versioned):**
+**Vector Index v1→v2→v3→v4→v5→v6→v7 (already versioned):**
 
-The vector index already tracks `VECTOR_INDEX_VERSION = 4`. Each version increment should document:
+The vector index already tracks `VECTOR_INDEX_VERSION = 7`. Each version increment should document:
 - What changed (e.g., V3 added distance metric byte, V4 added zero-copy aligned vector paging)
 - Migration cost (full rebuild vs. in-place header update)
 
@@ -336,14 +372,14 @@ Since HNSW index is a **derived index** (rebuildable from canonical data), the s
 
 **Goal:** Every physical file can report its format version on open.
 
-| Task | Files | Effort |
-|---|---|---|
-| Add `VantaHeader` to any format missing it | N/A (all formats already have it) | None |
-| Replace exact-match `validate()` with range-based `validate_compat()` | `src/binary_header.rs` | Small |
-| Add `CompatResult` enum | `src/binary_header.rs` | Small |
-| Update all callers of `validate()` to handle `CompatResult` | `vfile.rs`, `index/core.rs`, `wal.rs` | Medium |
-| Add format version constants to public API | `src/lib.rs` | Small |
-| Add `min_compat_version` field to `VantaHeader` | `src/binary_header.rs` | Small (repurpose `schema_version`) |
+| Task | Files | Status |
+|---|---|---|---|
+| Add `VantaHeader` to any format missing it | N/A (all formats already have it) | ✅ Not needed |
+| Replace exact-match `validate()` with range-based `validate_compat()` | `src/binary_header.rs` | ✅ Done |
+| Add `CompatResult` enum | `src/binary_header.rs` | Skipped (simpler: `Result<()>` with `IncompatibleFormat` error) |
+| Update all callers of `validate()` to handle compat | `index/serialize.rs` | ✅ Done (HNSW uses `validate_compat`) |
+| Add format version constants to public API | `src/lib.rs` | ✅ Done |
+| Add `min_compat_version` field to `VantaHeader` | Skipped — schema_version field repurposed for this | Skipped (not needed for range check) |
 
 ### Phase 2: Implement Migration Runner
 

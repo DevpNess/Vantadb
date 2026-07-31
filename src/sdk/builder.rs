@@ -1,8 +1,11 @@
+use crate::agentic::thread::ThreadStore;
 use crate::config::VantaConfig;
 use crate::error::{Result, VantaError};
+use crate::graphrag::pipeline::{GraphRagPipeline, GraphRagResult};
 use crate::index::set_prefetch_mode;
 use crate::storage::StorageEngine;
 use parking_lot::RwLock;
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use tracing;
@@ -70,6 +73,100 @@ impl VantaEmbedded {
         self.engine.read().clone().ok_or(VantaError::NotInitialized)
     }
 
+    /// Create an empty handle (no engine) for tests.
+    /// Produces `NotInitialized` errors on any engine-dependent operation.
+    #[doc(hidden)]
+    pub fn test_empty(config: VantaConfig) -> Self {
+        Self {
+            engine: Arc::new(RwLock::new(None)),
+            config,
+        }
+    }
+
+    /// Run the GraphRAG pipeline: seed → expand → retrieve → generate context.
+    ///
+    /// Uses the default pipeline configuration (seed_k=10, hops=2, max=100, top_k=20).
+    /// For custom settings, construct [`GraphRagPipeline`] directly.
+    pub fn graphrag_search(
+        &self,
+        namespace: &str,
+        query: Option<&str>,
+        query_vector: Option<&[f32]>,
+    ) -> Result<GraphRagResult> {
+        let pipeline = GraphRagPipeline::new();
+        pipeline.search(self, namespace, query, query_vector)
+    }
+
+    // ── Agentic Threads ──
+
+    /// Create a new conversation thread.
+    ///
+    /// Returns the thread's numeric ID. Pass `ttl_secs` for auto-expiry.
+    pub fn create_thread(&self, title: &str, ttl_secs: Option<u64>) -> Result<u128> {
+        let engine = self.engine_handle()?;
+        let store = ThreadStore::new(&engine);
+        store.create_thread(title, HashMap::new(), ttl_secs, None)
+    }
+
+    /// Append a message to a thread.
+    pub fn send_message(&self, thread_id: u128, role: &str, content: &str) -> Result<()> {
+        let engine = self.engine_handle()?;
+        let store = ThreadStore::new(&engine);
+        store.send_message(thread_id, role, content, HashMap::new(), None)
+    }
+
+    /// Retrieve a thread by its ID.
+    pub fn get_thread(&self, thread_id: u128) -> Result<Option<crate::agentic::MessageThread>> {
+        let engine = self.engine_handle()?;
+        let store = ThreadStore::new(&engine);
+        store.get_thread(thread_id)
+    }
+
+    /// List threads with pagination.
+    pub fn list_threads(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<crate::agentic::MessageThread>> {
+        let engine = self.engine_handle()?;
+        let store = ThreadStore::new(&engine);
+        store.list_threads(limit, offset)
+    }
+
+    /// Delete a thread by its ID.
+    pub fn delete_thread(&self, thread_id: u128) -> Result<()> {
+        let engine = self.engine_handle()?;
+        let store = ThreadStore::new(&engine);
+        store.delete_thread(thread_id)
+    }
+
+    /// Purge threads whose TTL has expired.
+    ///
+    /// Returns the number of threads removed.
+    pub fn purge_expired_threads(&self) -> Result<usize> {
+        let engine = self.engine_handle()?;
+        let store = ThreadStore::new(&engine);
+        store.purge_expired_threads()
+    }
+
+    /// Recover archived (shadow-archived) nodes that belonged to a summary node.
+    ///
+    /// Scans the TombstoneStorage partition for nodes with a `belonged_to`
+    /// edge targeting `summary_id`, re-activates them, and inserts them
+    /// back into the active store.
+    #[tracing::instrument(skip(self), err)]
+    pub fn recover_archived_nodes(
+        &self,
+        summary_id: u128,
+    ) -> Result<Vec<crate::sdk::VantaNodeRecord>> {
+        let engine = self.engine_handle()?;
+        let nodes = engine.recover_archived_nodes(summary_id)?;
+        Ok(nodes
+            .into_iter()
+            .map(|n| engine.node_to_record(n))
+            .collect())
+    }
+
     /// Flush and close the embedded engine handle.
     #[tracing::instrument(skip(self), err)]
     pub fn close(&self) -> Result<()> {
@@ -79,5 +176,136 @@ impl VantaEmbedded {
         let mut guard = self.engine.write();
         *guard = None;
         Ok(())
+    }
+
+    // ── Filesystem Snapshots ──
+
+    /// Create an instant filesystem snapshot via hard links (Unix) or copy (Windows).
+    ///
+    /// All data files in the storage directory are hard-linked into
+    /// `<data_dir>/snapshots/<name>`, giving an O(1) point-in-time image.
+    pub fn create_snapshot(&self, name: &str) -> Result<crate::storage::FsSnapshot> {
+        let engine = self.engine_handle()?;
+        engine.create_snapshot(name)
+    }
+
+    /// List all existing snapshot names.
+    pub fn list_snapshots(&self) -> Result<Vec<String>> {
+        let engine = self.engine_handle()?;
+        engine.list_snapshots()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_empty_embedded() -> VantaEmbedded {
+        VantaEmbedded::test_empty(VantaConfig::default())
+    }
+
+    // ── Debug ──
+
+    #[test]
+    fn test_debug_impl_closed() {
+        let e = make_empty_embedded();
+        let d = format!("{:?}", e);
+        assert!(d.contains("VantaEmbedded"), "got: {d}");
+        assert!(d.contains("is_open"), "got: {d}");
+        assert!(d.contains("false"), "got: {d}");
+    }
+
+    #[test]
+    fn test_debug_impl_contains_config() {
+        let e = make_empty_embedded();
+        let d = format!("{:?}", e);
+        assert!(d.contains("config"), "got: {d}");
+    }
+
+    // ── engine_handle ──
+
+    #[test]
+    fn test_engine_handle_none_errors() {
+        let e = make_empty_embedded();
+        let result = e.engine_handle();
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        assert!(err.to_string().contains("initialized"), "got: {err}");
+    }
+
+    // ── close ──
+
+    #[test]
+    fn test_close_on_empty_ok() {
+        let e = make_empty_embedded();
+        // close on an already-None engine should not panic
+        assert!(e.close().is_ok());
+    }
+
+    #[test]
+    fn test_close_then_engine_handle_fails() {
+        let e = make_empty_embedded();
+        let _ = e.close();
+        let result = e.engine_handle();
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        assert!(err.to_string().contains("initialized"), "got: {err}");
+    }
+
+    // ── VantaConfig defaults used by builder ──
+
+    #[test]
+    fn test_default_config_values() {
+        let cfg = VantaConfig::default();
+        assert!(!cfg.read_only);
+        assert_eq!(cfg.port, 8080);
+        assert_eq!(cfg.host, "127.0.0.1");
+    }
+
+    // ── recover_archived_nodes ──
+
+    #[test]
+    fn test_recover_archived_nodes_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let embedded = VantaEmbedded::open(dir.path()).unwrap();
+        let result = embedded.recover_archived_nodes(42);
+        assert!(
+            result.is_ok(),
+            "recover_archived_nodes should succeed on empty DB"
+        );
+        let nodes = result.unwrap();
+        assert!(nodes.is_empty(), "no archived nodes to recover");
+    }
+
+    #[test]
+    fn test_recover_archived_nodes_with_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let embedded = VantaEmbedded::open(dir.path()).unwrap();
+        let engine = embedded.engine_handle().unwrap();
+
+        // Insert an archived node directly into TombstoneStorage
+        let belonged_to_id = engine.intern_label("belonged_to");
+        let mut archived = crate::node::UnifiedNode::new(100);
+        archived.edges.push(crate::node::Edge {
+            target: 1,
+            label_id: belonged_to_id,
+            weight: 1.0,
+            reverse: false,
+        });
+        let data = postcard::to_allocvec(&archived)
+            .map_err(|e| format!("serialization: {e}"))
+            .unwrap();
+        engine
+            .put_to_partition(
+                crate::storage::BackendPartition::TombstoneStorage,
+                b"archived_100",
+                &data,
+            )
+            .expect("put archived node");
+
+        // Recover via the SDK method
+        let nodes = embedded.recover_archived_nodes(1).unwrap();
+        assert_eq!(nodes.len(), 1, "should recover 1 node");
+        assert_eq!(nodes[0].id, 100, "recovered node id should match");
     }
 }

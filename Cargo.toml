@@ -11,10 +11,14 @@ homepage = "https://vantadb.dev"
 documentation = "https://docs.rs/vantadb"
 keywords = ["database", "vector", "graph", "embedded", "rust"]
 categories = ["database-implementations"]
-exclude = ["test/"]
+exclude = [
+    "test/",
+    "benchmarks/data_comp_bench/",
+    ".opencode/references/",
+]
+
 [badges]
 maintenance = { status = "actively-developed" }
-
 [lints]
 workspace = true
 
@@ -29,6 +33,7 @@ portable-atomic = "1"
 lru = "0.16"
 dashmap = "6"
 arc-swap = "1.7"
+bytemuck = "1.18"
 zerocopy = { version = "0.8", features = ["derive"] }
 smallvec = "1.15"
 
@@ -66,12 +71,15 @@ indicatif = { version = "0.18", optional = true }
 console = { version = "0.16", optional = true }
 clap = { version = "4.4", features = ["derive", "env"], optional = true }
 clap_complete = { version = "4.4", optional = true }
+ratatui = { version = "0.28", optional = true }
+crossterm = { version = "0.28", optional = true }
 rayon = { version = "1.12", optional = true }
 tracing = "0.1"
 notify = { version = "8", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 twox-hash = "2.1.2"
 fail = { version = "0.5", optional = true, features = ["failpoints"] }
+tempfile = { version = "3", optional = true }
 opentelemetry = { version = "0.32.0", optional = true }
 tracing-opentelemetry = { version = "0.33.0", optional = true }
 tantivy = { version = "0.26", optional = true, features = ["stopwords"] }
@@ -80,16 +88,17 @@ web-time = "1.1.0"
 aes-gcm = { version = "0.10", optional = true }
 sha2 = { version = "0.10", optional = true }
 ahash = "0.8.12"
+croaring = "2.6.0"
 
 [features]
-default = ["cli", "arrow", "fjall", "sysinfo", "memmap2", "fs2", "prometheus", "rayon", "advanced-tokenizer"]
+default = ["cli", "arrow", "fjall", "advanced-tokenizer", "memmap2", "fs2", "sysinfo"]
 async-ingestion = ["dep:tokio", "tokio/sync", "tokio/macros", "tokio/rt"]
 async-io = ["dep:tokio", "tokio/fs", "tokio/io-util"]
 arrow = ["dep:arrow"]
 rocksdb = ["dep:rocksdb"]
 fjall = ["dep:fjall"]
 cli = ["dep:indicatif", "dep:console", "dep:clap", "dep:clap_complete"]
-failpoints = ["dep:fail"]
+failpoints = ["dep:fail", "dep:tempfile"]
 remote-inference = ["dep:reqwest"]
 python_sdk = ["pyo3"]
 custom-allocator = ["mimalloc"]
@@ -103,11 +112,11 @@ opentelemetry = [
     "dep:opentelemetry-otlp",
     "opentelemetry_sdk/rt-tokio",
 ]
-governance = []
 hot-reload = ["dep:notify"]
 encryption = ["dep:aes-gcm", "dep:sha2"]
 wal-shipping = ["dep:reqwest"]
 pitr = []
+bayesian_decay = []
 server = [
     "cli",
     "dep:tokio",
@@ -117,6 +126,7 @@ server = [
 ]
 tls = ["dep:axum-server", "dep:rustls"]
 sysinfo = ["dep:sysinfo"]
+tui = ["dep:ratatui", "dep:crossterm", "cli"]
 
 [dependencies.mimalloc]
 version = "0.1"
@@ -135,6 +145,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_ProcessStatus",
     "Win32_System_Threading",
     "Win32_System_Memory",
+    "Win32_System_SystemInformation",
     "Win32_Foundation",
 ] }
 
@@ -191,6 +202,22 @@ harness = false
 
 [[bench]]
 name = "hnsw_recall_ef"
+harness = false
+
+[[bench]]
+name = "vfile_search"
+harness = false
+
+[[bench]]
+name = "incremental_bench"
+harness = false
+
+[[bench]]
+name = "param_sweep"
+harness = false
+
+[[bench]]
+name = "acorn_filtered_search"
 harness = false
 
 [[bin]]
@@ -289,6 +316,10 @@ path = "tests/api/structured_api_v2.rs"
 name = "columnar"
 path = "tests/logic/columnar.rs"
 required-features = ["arrow"]
+
+[[test]]
+name = "joins"
+path = "tests/logic/joins.rs"
 
 [[test]]
 name = "mmap_index"
@@ -473,6 +504,14 @@ path = "tests/security.rs"
 name = "sdk_serialization"
 path = "tests/sdk_serialization.rs"
 
+[[test]]
+name = "graphrag_test"
+path = "tests/graphrag_test.rs"
+
+[[test]]
+name = "message_thread_test"
+path = "tests/message_thread_test.rs"
+
 # ── Examples ──
 [[example]]
 name = "basic"
@@ -494,6 +533,12 @@ path = "examples/rust/concurrent.rs"
 lto = "thin"
 codegen-units = 1
 opt-level = 3
+
+# Bench profile: release-like with debug symbols for profiling (samply, flamegraph).
+# debug=1 emits line tables + function names for flamegraphs without full debug vars.
+[profile.bench]
+inherits = "release"
+debug = 1
 
 # Fast dev profile: balance between compilation speed and runtime performance.
 # opt-level=1 gives ~35% faster builds than 0 while keeping debug usable.
@@ -535,24 +580,17 @@ members = [
     "vantadb-server",
     "vantadb-mcp",
     "vantadb-wasm",
-    "vantadb-mem0",
-    "vantadb-letta",
-    "vantadb-crewai",
-    "vantadb-dspy",
-    "vantadb-haystack",
-    "vantadb-litellm",
-    "vantadb-openai",
-    "vantadb-ollama",
-    "vantadb-langchain",
-    "vantadb-llamaindex",
 ]
+# NOTE: providers/openai, providers/ollama, providers/litellm are NOT workspace members.
+# They use pyo3 + cdylib which triggers MSVC linker crash on Windows during workspace
+# builds. Build individually with `cargo build -p vantadb-openai` etc. on non-Windows.
 default-members = [
     ".",
     "vantadb-python",
-    "vantadb-server",
-    "vantadb-mcp",
-    "vantadb-wasm",
 ]
+# CATEGORY: EXPERIMENTAL — vantadb-server, vantadb-mcp, vantadb-wasm were removed from
+# default-members. A failure in an experimental crate must not block core CI.
+# See docs/operations/CI_POLICY.md for the experimental crate policy.
 
 [workspace.package]
 version = "0.4.0"
@@ -566,8 +604,7 @@ exclude = ["fuzz"]
 debug = 1
 opt-level = 0
 
-# Optimizaciones específicas para WASM (solo aplica cuando se compila para wasm32)
-[target.wasm32-unknown-unknown.profile.release]
-opt-level = "s"
-strip = true
-codegen-units = 1
+# ponytail: removed invalid [target.wasm32-unknown-unknown.profile.release]
+# Cargo.toml does not support per-target profile overrides — Cargo silently
+# ignored opt-level, strip, and codegen-units here. WASM builds use default
+# release settings. Add back via .cargo/config.toml if size becomes critical.

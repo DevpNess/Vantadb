@@ -2,6 +2,16 @@
 
 > **🛡️ Validation Rule:** Si no estás 100% seguro de una respuesta, análisis o decisión técnica, DEBES validar contra internet (`websearch`/`webfetch`). Para herramientas, librerías o APIs, la fuente de verdad es su documentación oficial o GitHub. No confíes en conocimiento interno del modelo si hay duda.
 
+## Manual de Operación
+
+Todo el detalle del sistema de tareas, agentes, skills, MCP servers, y su integración está en:
+
+📖 **`.opencode/VANTADB-OPERATING-MANUAL.md`** — Manual de Operación completo (948 líneas, 14 secciones)
+
+📖 **`SKILLS-MANIFEST.md`** — Catálogo completo de las 104 skills del proyecto (raíz)
+
+Consultar para: entender cómo se relacionan los componentes del sistema, flujos de integración, troubleshooting, y reglas avanzadas.
+
 ## Pipeline & Command System
 
 El sistema de pipeline vive en `.opencode/` y se activa cuando el usuario envía un comando.
@@ -341,104 +351,66 @@ git up
 release-plz release                 # bump + changelog + tag + publish
 ```
 
-## Web Frontend (Vite + React + TanStack Router)
+## Web Frontend (Next.js 16 + shadcn/ui + framer-motion)
 
-Stack: **Vite 8 + React 19 + TanStack Router v1 + GSAP 3.15 + Tailwind CSS v4**
+Stack: **Next.js 16 + React 19 + shadcn/ui (New York) + Tailwind CSS v4 + framer-motion + animejs**
 
 ### Estructura
 
 ```
 web/
   src/
-    routes/        ← 27 rutas TanStack (lazy-loaded)
-    components/    ← nb/ (18 design system components) + compuestos (NbTrustBar, NbArchSection...)
-    styles/        ← 46 CSS → 31 tras cleanup. nb-base.css (base + grid) + nb-components.css (componentes + utilitarias)
-    lib/           ← gsap.ts (plugins registrados), utils.ts (cn)
-    hooks/         ← useScrollReveal (IntersectionObserver + "is-visible")
+    app/           ← Next.js App Router pages (all "use client")
+    components/
+      ui/          ← shadcn/ui components (Radix-based)
+      vanta/       ← VantaDB-specific components (hero, features, etc.)
+    hooks/         ← count-up, focus-trap, reveal, toast, etc.
+    lib/           ← dictionaries.ts (i18n ~880 ES/EN keys), utils.ts (cn)
+  public/
+    assets/        ← images
 ```
 
 ### Stack decisions
 
 | Decisión | Por qué |
 |----------|---------|
-| **Vite 8** | Última major, esbuild nativo, HMR instantáneo |
-| **React 19** | Server Components no usados (SPA), pero aprovecha use() y mejoras de rendering |
-| **TanStack Router v1** | Type-safe first class, lazy routes, search params |
-| **GSAP 3.15** | ScrollTrigger + TextPlugin + DrawSVG registrados. Plugins gratuitos desde 2024 |
-| **Tailwind v4** | CSS-first config (tokens.css importa tailwindcss). NO tailwind.config.js |
-| **@tanstack/react-query** | Para fetching si se agrega API |
-| **split-type** | Text reveal animations (hero, section headers) |
-| **@observablehq/plot** | Benchmarks (lazy-load, ~45KB gzip) |
-| **simple-icons** | Logos de tecnologías (tree-shakeable) |
+| **Next.js 16** | App Router, standalone output, `ignoreBuildErrors: true` en next.config.ts |
+| **React 19** | Client components everywhere (no RSC) |
+| **shadcn/ui** | New York style, neutral base, lucide icons |
+| **framer-motion** | Page transitions via AnimatePresence, scroll reveal |
+| **Tailwind v4** | Theme via `@theme inline {}` in globals.css; `tailwind.config.ts` inert |
+| **animejs** | Interactive graph animation (mark-classic.tsx) |
+| **next-themes** | Class-based theme switching (light default) |
+| **zustand** | State management (installed, usage TBD) |
 
-### Design System (nb/)
+### Design System (globals.css + shadcn)
 
-18 componentes en `src/components/nb/`. Calidad promedio auditada: 7.9/10.
+Colores: cream `#FBF9F5`, ink `#000000`, neon `#FF5500`, paper `#F2EDE2`, smoke `#1A1A1A`.
+Bordes: `border-4 border-black` con rigid shadow `shadow-[6px_6px_0_0_#000]`.
+Efectos: press/press-lg/glow-neon/glitch-hover/scanlines/halftone/speed-lines/grid-tech.
 
-| Componente | Propósito |
-|------------|-----------|
-| NbSectionHeader | Hero + section titles con `nb-section-header` + `--bordered`/`--center` |
-| NbCardFrame | Tarjetas con border + offset shadow (engine, architecture) |
-| NbDitherImage | Imagen con filtro SVG dithering (about/team) |
-| NbCursor | Cursor parpadeante terminal |
-| NbSplitFlap | Efecto split-flap display |
-| NbMarquee | Marquee horizontal infinito |
-| NbFeatureGrid | Grid asimétrico (7fr-5fr) con iconos |
-| NbPricingCard | Card de pricing con lista de features |
-| NbFaqAccordion | Acordeón FAQ |
-| NbTerminalBlock | Bloque de terminal con sintaxis |
-| NbBenchmarkGrid | Grid de benchmarks |
-| NbArchSection | Sección de arquitectura con spec table |
-| NbDataTrust | Trust bar animado |
-| NbEcosystem | Grid de ecosistema |
+### i18n (custom)
 
-### Sistema de animación
+`LanguageProvider` context + `useLanguage()` hook → `{ t, lang, setLang }`. Dictionary ~880 ES/EN keys. `next-intl` installed but unused.
 
-- GSAP registrado en `src/lib/gsap.ts` (ScrollTrigger, TextPlugin, DrawSVGPlugin, useGSAP)
-- ScrollTrigger para animaciones basadas en scroll (pin, scrub, reveal)
-- TextPlugin para typewriter/heor text reveals
-- DrawSVGPlugin para SVG draw animations
-- `useScrollReveal` hook para reveal básico vía IntersectionObserver (clase `is-visible`)
-- Animaciones existentes en varias rutas (engine, latency, hero)
+### Animación
 
-### CSS Architecture
-
-- **nb-base.css**: Reset, layout helpers (`.nb-section`, `.nb-grid`, `.nb-inner`), tipografía base (`.nb-title`, `.nb-sub`)
-- **nb-components.css**: Componentes concretos (`.nb-card`, `.nb-btn`, `.nb-frame`, `.nb-bento`, `.nb-table`, `.nb-cmd-block`, `.nb-marquee`, `.nb-trust-*`, `.nb-metric-*`, `.nb-card-frame`, `.nb-num-marker`)
-- **tokens.css**: Variables CSS + Tailwind v4 theme
-- **index.css**: Entry point que `@import`a todos los CSS base
-- Archivos de ruta: cada ruta lazy importa su propio CSS
-
-### Patrones a seguir
-
-- **Variantes de clase**: `nb-card--amber`, `nb-card--strong` (modificador BEM)
-- **Estados**: Preferir data attributes (`[data-state="active"]`) sobre clases de estado
-- **CSS Modules**: No usar. Preferir CSS plano con naming BEM + `cn()` para composición
-- **Media queries**: Breakpoints: 960px (tablet), 768px (small tablet), 640px (mobile)
-- **prefers-reduced-motion**: Siempre incluir en animaciones nuevas
-- **Tailwind**: Solo para prototyping rápido. Preferir variables CSS + clases nb/ para producción
-
-### Performance Budget
-
-| Recurso | Límite actual | Target |
-|---------|--------------|--------|
-| Bundle JS (gzip) | ~150KB | <120KB |
-| CSS (gzip) | ~25KB | <20KB |
-| Fonts (gzip, 3 variables) | ~500KB | ~500KB (no cambiar) |
-| GSAP (gzip) | ~100KB | ~100KB (necesario para animaciones existentes) |
+- Page transitions: `<PageTransition viewKey={pathname}>` wrapping layout children (framer-motion)
+- Scroll reveal: `<Reveal direction="up" delay={n}>` wrapping sections
+- Count-up: `<CountUpStat value={N} suffix="vec/s" />`
+- Animejs: SVG interactive graph in mark-classic.tsx
 
 ### Contenido
 
-- **NO** usar "ONNX", "Sled", "LangChain", "LlamaIndex" — ya no existen en el código real
 - Stack real: **Rust 1.94**+ | **Python 3.11**+ | Fjall + RocksDB + InMemory backends
 - Integraciones reales: CrewAI + DSPy + Haystack + Mem0 + OpenAI + Ollama + LiteLLM
 - Versión: **0.2.0** (no 0.1.5)
-- Embedding providers: OpenAI, Ollama, LiteLLM (no "any ONNX model")
+- Embedding providers: OpenAI, Ollama, LiteLLM
 
 ## Skills Manifest
 
 **Todas las skills están centralizadas en:**
-- `.agents/skills/` (proyecto, 116 skills esenciales)
+- `.agents/skills/` (proyecto, 104 skills esenciales)
 - Referencia completa en: `SKILLS-MANIFEST.md` (raíz del proyecto)
 
 **Siempre preferir la copia del proyecto sobre la global.**
@@ -489,7 +461,7 @@ Skills de ingeniería instaladas desde [addyosmani/agent-skills](https://github.
 
 **Personas especializadas** (`.opencode/agents/`): `vanta-audit` (Security + Code Review), `vanta-chaos` (Fuzzing + Resilience), `vanta-tuner` (Performance + Observability). Legacy `code-reviewer`, `security-auditor`, `test-engineer` eliminados — reemplazados por vanta-*.
 
-**Referencias** (`.opencode/references/`): `definition-of-done.md`, `testing-patterns.md`, `security-checklist.md`, `performance-checklist.md`, `accessibility-checklist.md`, `observability-checklist.md`.
+**Referencias** (`.opencode/references/`, **12 total**): `definition-of-done.md`, `testing-patterns.md`, `security-checklist.md`, `performance-checklist.md`, `accessibility-checklist.md`, `observability-checklist.md`, `orchestration-patterns.md`, `REFERENCE-SYNTHESIS.md`, `awesome-harness-engineering/`, `darwin-godel-machine/`, `deepclaude/`, `statewright/`.
 
 ### Anti-Rationalization (MUST)
 
@@ -790,6 +762,11 @@ Configurados globalmente en `%USERPROFILE%\.config\opencode\opencode.json`.
 | **CodeGraph** | `codegraph serve --mcp` | Grafo de conocimiento del código (7.3K símbolos). Resuelve símbolos, flujos, blast radius |
 | **Pencil** | `mcp-server-windows-x64.exe` | Editor de archivos `.pen` — diseño UI visual, reemplazo de Figma |
 | **Playwright** | `@playwright/mcp` | Automatización de navegador: navegar, click, screenshot, snapshot, redes |
+| **Campaign** | `node .opencode/task-system/mcp/campaign-server.mjs` | Task system: 30+ tools para plan, task, verify, state machine |
+| **MetaSearchMCP** | `metasearchmcp-mcp` | Búsqueda multi-provider: web, GitHub, académico, código. DuckDuckGo gratis |
+| **Argus** | `argus mcp serve` | 14 providers, extracción 12-step, dead URL recovery |
+| **Discord** | `discord-mcp` | Gestión de servidor Discord: canales, roles, moderación |
+| **LottieFiles Creator** | `@lottiefiles/creator-mcp` | Crear y editar animaciones Lottie vía IA |
 | ~~**Recraft**~~ | ~~`@recraft-ai/mcp-recraft-server`~~ | ❌ Eliminado — sin API key |
 | **cargo-mcp** | `cargo-mcp serve` | Ejecutar comandos Cargo: `check`, `clippy`, `test`, `build`, `fmt`, `add`, `remove`, `bench`, `run` |
 | **rust-analyzer-mcp** | `rust-analyzer-mcp` | LSP completo: goto def, hover, references, completions, diagnostics, rename, format |
@@ -821,7 +798,7 @@ NUNCA sugieras mergear a `main` o pushear código sin antes ejecutar el pipeline
 
 ### Regla 2: Tolerancia Cero a Flaky Tests e Ignorancia de Errores
 
-**Prohibición absoluta:** Está estrictamente prohibido sugerir o escribir `continue-on-error: true` en cualquier GitHub Action nuevo o existente (se heredan 5 instancias listadas en P0-2, P0-4).
+**Prohibición absoluta:** Está estrictamente prohibido sugerir o escribir `continue-on-error: true` en cualquier GitHub Action nuevo o existente (se heredan 7 instancias, todas con `# CATEGORY:` explícita). Ver taxonomía en `docs/operations/CI_POLICY.md` (secciones EXPERIMENTAL / BEST-EFFORT / NON-CRITICAL / INFORMATIONAL). Cualquier nueva exención requiere justificación + CATEGORY tag.
 
 | Si el usuario hace... | Debes responder... |
 |---|---|
@@ -883,6 +860,77 @@ El saldo neto de deuda técnica por PR debe ser **cero o negativo**.
 | P2-6 | `lib.rs:688-712` | Match no exhaustivo en `VantaError` | 🟢 15 min |
 | P2-7 | `lib.rs:895-901` | Serialización completa sin zero-copy path | 🟡 4-8 hr |
 | P2-8 | `lib.rs:394-413` | `collect_all_deduped()` O(n) en memoria | 🟡 2-4 hr |
+
+### Regla 7: Release Workflow — main/develop + Conventional Commits
+
+El proyecto usa el modelo **main como rama de releases**, develop como rama de trabajo, y **release-plz** para automatizar versionado y publicación.
+
+#### Ramas
+
+| Rama | Propósito | Regla |
+|------|-----------|-------|
+| `main` | Releases únicamente | Nunca commitear directo. Solo PRs desde develop. |
+| `develop` | Trabajo diario | Toda modificación arranca acá. |
+
+#### Flujo de Release
+
+```
+cambiar código en develop → commit → push → PR a main → merge a main
+                                                         ↓
+                     release-plz detecta push a main (GitHub Actions)
+                     → analiza conventional commits desde el último tag
+                     → bump automático (major/minor/patch según commits)
+                     → actualiza docs/CHANGELOG.md
+                     → crea Release PR (ej: "chore: release v0.4.1")
+                     → vos revisás el PR y lo mergeás
+                     → release-plz taguea y publica en crates.io
+                     → los workflows RELEASE Wheels/NPM/Binaries se disparan
+```
+
+#### Conventional Commits (obligatorio para release-plz)
+
+release-plz usa el mensaje del commit para determinar el bump semver:
+
+| Commit | Bump | Ejemplo |
+|--------|------|---------|
+| `feat:` | minor | `feat: add cosine distance metric` |
+| `fix:` | patch | `fix: overflow in take_bytes bounds` |
+| `docs:` | patch | `docs: update QUICKSTART.md` |
+| `test:` | patch | `test: add edge case for empty index` |
+| `perf:` | patch | `perf: reduce clone in hot path` |
+| `refactor:` | patch | `refactor: extract hnsw builder` |
+| `ci:` | no release | `ci: fix timeout in fuzz workflow` |
+| `chore:` | no release | `chore: bump getrandom to 0.4` |
+| `feat!:` o `feat:` + `BREAKING CHANGE:` | major | `feat!: redesign search API` |
+
+**Reglas estrictas:**
+- `feat:` siempre implica minor (puede haber breaking changes hasta 1.0.0)
+- Si un cambio es breaking aunque sea `0.x`, usar `feat!:` igual
+- Commits sin conventional commit → release-plz los ignora
+- **NUNCA** tocar version en Cargo.toml manualmente — release-plz lo hace solo
+- **NUNCA** tocar `docs/CHANGELOG.md` manualmente — release-plz lo actualiza
+- **NUNCA** crear tags manualmente — release-plz los crea
+
+#### Hacer un Release (sin esperar a release-plz)
+
+Si el usuario necesita un release inmediato sin pasar por el ciclo de release-plz:
+
+1. Verificar que develop tiene los cambios deseados
+2. Hacer PR de develop → main, mergear
+3. El workflow `RELEASE Automated` va a crear un Release PR automáticamente
+4. Si el usuario quiere publicar YA sin esperar: seguir el flujo manual de `cargo publish`, `maturin publish`, `npm publish`
+
+#### Secrets de CI necesarios
+
+| Secret | Dónde está | Propósito |
+|--------|-----------|-----------|
+| `CARGO_REGISTRY_TOKEN` | GitHub Secrets | Publicar en crates.io |
+| `NPM_TOKEN` | GitHub Secrets | Publicar en npm |
+| `TEST_PYPI_API_TOKEN` | GitHub Secrets | PyPI test registry |
+
+#### Pre-push Gate
+
+El pre-push hook corre: `cargo fmt → cargo check → cargo clippy → cargo deny check → cargo nextest run`.
 
 <!-- Learnings: P1-2 — 2026-07-17 -->
 - `nextest.toml` está en `.config/` (no en raíz). Buscar con `Get-ChildItem -Filter` si `Read` falla.

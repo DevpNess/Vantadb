@@ -111,6 +111,50 @@ pub enum Commands {
     /// Display database health diagnostics and system status
     Status,
 
+    /// Create a filesystem-level backup of the database directory
+    Backup {
+        /// Output directory for the backup (default: vantadb_backups/backup_<timestamp>)
+        #[arg(long)]
+        out: Option<String>,
+    },
+
+    /// Restore the database from a previously created backup directory
+    Restore {
+        /// Path to the backup directory
+        #[arg(long)]
+        input: String,
+        /// Overwrite existing database directory if it exists
+        #[arg(long)]
+        force: bool,
+        /// Rebuild indexes after restore
+        #[arg(long)]
+        rebuild: bool,
+    },
+
+    /// Run comprehensive health diagnostics on the database
+    Doctor,
+
+    /// Inspect a single record showing all fields, vectors, and metadata
+    Inspect {
+        /// Namespace of the record
+        #[arg(long)]
+        namespace: String,
+        /// Key of the record to inspect
+        #[arg(long)]
+        key: String,
+    },
+
+    /// Display detailed database statistics in human-readable or JSON format
+    Stats {
+        /// Output statistics as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Launch the interactive TUI (requires `tui` feature)
+    #[cfg(feature = "tui")]
+    Tui,
+
     /// Generate shell completion scripts
     Completions {
         /// Shell type for the completion script
@@ -147,6 +191,47 @@ pub enum Commands {
         key: String,
     },
 
+    /// Delete all records in a namespace matching a JSON metadata filter
+    DeleteByFilter {
+        /// Namespace to operate on
+        #[arg(long)]
+        namespace: String,
+        /// JSON filter in MongoDB-like format, e.g. '{"field": {"$op": value}}'
+        /// Operators: $eq, $neq, $gt, $gte, $lt, $lte
+        /// Example: '{"status": {"$eq": "inactive"}}'
+        #[arg(long)]
+        filter: String,
+    },
+
+    /// Count records in a namespace, optionally filtered by metadata
+    Count {
+        /// Namespace to count records in
+        #[arg(long)]
+        namespace: String,
+        /// Optional JSON filter (same format as delete-by-filter)
+        #[arg(long)]
+        filter: Option<String>,
+        /// Output as raw number only
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Find records similar to a given key using vector similarity search
+    SimilarToKey {
+        /// Namespace of the reference record
+        #[arg(long)]
+        namespace: String,
+        /// Key of the reference record
+        #[arg(long)]
+        key: String,
+        /// Number of similar records to return
+        #[arg(long, default_value = "10")]
+        top_k: usize,
+        /// Output in JSON format
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Migrate a database to the latest storage schema version
     #[command(subcommand)]
     Migrate(MigrateCommand),
@@ -154,6 +239,49 @@ pub enum Commands {
     /// Manage namespaces
     #[command(subcommand)]
     Namespace(NamespaceCommand),
+
+    /// Manage instant filesystem snapshots
+    #[command(subcommand)]
+    Snapshot(SnapshotCommand),
+
+    /// Manage the Write-Ahead Log (compact, vacuum)
+    #[command(subcommand)]
+    Wal(WalCommand),
+
+    /// Search across multiple namespaces and merge results by score
+    SearchMulti {
+        /// Comma-separated list of namespaces to search (e.g. "ns1,ns2,ns3")
+        #[arg(long)]
+        namespaces: String,
+        /// Text query for hybrid/lexical search
+        #[arg(long)]
+        query: Option<String>,
+        /// Optional explicit vector query (comma-separated f32 values)
+        #[arg(long)]
+        query_vector: Option<String>,
+        /// Maximum number of results across all namespaces
+        #[arg(long, default_value = "10")]
+        top_k: usize,
+        /// Output in JSON format
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Search across ALL known namespaces and merge results by score
+    SearchAll {
+        /// Text query for hybrid/lexical search
+        #[arg(long)]
+        query: Option<String>,
+        /// Optional explicit vector query (comma-separated f32 values)
+        #[arg(long)]
+        query_vector: Option<String>,
+        /// Maximum number of results across all namespaces
+        #[arg(long, default_value = "10")]
+        top_k: usize,
+        /// Output in JSON format
+        #[arg(long)]
+        json: bool,
+    },
 
     /// Start the HTTP or MCP server wrapper
     Server {
@@ -191,6 +319,18 @@ pub enum NamespaceCommand {
     },
 }
 
+/// Subcommands for filesystem snapshots
+#[derive(Subcommand, Debug, Clone)]
+pub enum SnapshotCommand {
+    /// Create an instant filesystem snapshot by hard-linking all data files
+    Create {
+        /// Name for the snapshot
+        name: String,
+    },
+    /// List all existing snapshots
+    List,
+}
+
 /// Subcommands for database migration
 #[derive(Subcommand, Debug, Clone)]
 pub enum MigrateCommand {
@@ -218,6 +358,15 @@ pub enum MigrateCommand {
         /// Path to the database directory
         target: String,
     },
+}
+
+/// Subcommands for Write-Ahead Log management
+#[derive(Subcommand, Debug, Clone)]
+pub enum WalCommand {
+    /// Compact the WAL: flush all data, archive the current WAL file, and start a fresh one
+    Compact,
+    /// Remove tombstoned nodes from HNSW and reclaim space
+    Vacuum,
 }
 
 /// Shell type for shell completion scripts

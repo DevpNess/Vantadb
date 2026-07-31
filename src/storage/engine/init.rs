@@ -15,6 +15,8 @@ use crate::backends::rocksdb_backend::RocksDbBackend;
 use crate::config::VantaConfig;
 use crate::error::{Result, VantaError};
 use crate::index::{CPIndex, IndexBackend};
+use crate::lsm::SegmentLevel;
+use crate::node::LabelIntern;
 use crate::storage::engine::StorageEngine;
 use crate::storage::engine::{BackendKind, FLAG_TOMBSTONE, GIB, MIB};
 use crate::storage::ops;
@@ -37,26 +39,29 @@ impl StorageEngine {
 
         let (lock_file, backend, data_dir) = Self::init_storage(path, &config)?;
 
-        let (hnsw, vector_store, wal_writer, wal_replay_ms, wal_records_replayed) =
+        let (hnsw, vector_store, segment_registry, wal_writer, wal_replay_ms, wal_records_replayed) =
             if matches!(config.backend_kind, BackendKind::InMemory) {
                 let hnsw = CPIndex::new();
-                let vector_store = VantaFile::create_in_memory(64 * MIB);
+                let vs = VantaFile::create_in_memory(64 * MIB);
+                let vstore = vec![parking_lot::RwLock::new(vs)];
+                let reg = crate::lsm::SegmentRegistry::new();
                 let wal_writer = None;
-                (hnsw, vector_store, wal_writer, 0u64, 0u64)
+                (hnsw, vstore, reg, wal_writer, 0u64, 0u64)
             } else {
-                let (mut hnsw, mut vector_store) =
+                let (mut hnsw, vector_store, segment_registry) =
                     Self::init_indexes(&data_dir, &config, caps, effective_memory)?;
                 let (wal_replay_ms, wal_records_replayed) = Self::recover_state(
                     &data_dir,
                     &config,
                     backend.as_ref(),
                     &mut hnsw,
-                    &mut vector_store,
+                    &vector_store,
                 )?;
                 let wal_writer = crate::storage::wal::init_wal(&data_dir, &config)?;
                 (
                     hnsw,
                     vector_store,
+                    segment_registry,
                     wal_writer,
                     wal_replay_ms,
                     wal_records_replayed,
@@ -70,10 +75,23 @@ impl StorageEngine {
         );
 
         let estimated_hnsw_bytes = hnsw.estimate_memory_bytes() as u64;
+        let resident_bytes: Option<u64> = {
+            let mut total: Option<u64> = None;
+            for vs in &vector_store {
+                let guard = vs.read();
+                if let Some(rb) = guard.mmap_resident_bytes() {
+                    total = Some(total.unwrap_or(0) + rb);
+                }
+            }
+            if let Some(rb) = hnsw.backend.mmap_resident_bytes() {
+                total = Some(total.unwrap_or(0) + rb);
+            }
+            total
+        };
         crate::metrics::record_memory_breakdown(
             hnsw.nodes.len() as u64,
             estimated_hnsw_bytes,
-            crate::storage::vfile::engine_mmap_resident_bytes(&hnsw, &vector_store),
+            resident_bytes,
             0,
             0,
         );
@@ -98,9 +116,12 @@ impl StorageEngine {
             volatile_cache: parking_lot::RwLock::new(std::collections::HashMap::new()),
             last_query_timestamp: std::sync::atomic::AtomicU64::new(0),
             next_txn_id: std::sync::atomic::AtomicU64::new(1),
+            active_txns: parking_lot::Mutex::new(std::collections::HashSet::new()),
+            txn_buffers: parking_lot::Mutex::new(std::collections::HashMap::new()),
             emergency_maintenance_trigger: std::sync::atomic::AtomicBool::new(false),
             data_dir,
-            vector_store: parking_lot::RwLock::new(vector_store),
+            vector_store,
+            segment_registry,
             wal: wal_writer.map(std::sync::Arc::new),
             _lock_file: lock_file,
             text_stats_cache: parking_lot::RwLock::new(std::collections::HashMap::new()),
@@ -115,9 +136,16 @@ impl StorageEngine {
                     crate::vector::governor::QuantizationConfig::default(),
                 ),
             ),
+            cache_warmer: crate::cache_warmer::CacheWarmer::new(),
             edge_index: Some(std::sync::Arc::new(crate::edge_index::EdgeIndex::new())),
             scalar_index: Some(std::sync::Arc::new(crate::scalar_index::ScalarIndex::new())),
+            label_intern: parking_lot::Mutex::new(LabelIntern::new()),
         };
+
+        // OLD-20: Warm HNSW top-layer nodes on startup so the first search
+        // doesn't pay a cold-start penalty reading entry-point nodes from disk.
+        engine.warm_hnsw_top_layer();
+
         Ok(engine)
     }
 
@@ -279,7 +307,11 @@ impl StorageEngine {
         config: &VantaConfig,
         caps: &crate::hardware::HardwareCapabilities,
         effective_memory: u64,
-    ) -> Result<(CPIndex, VantaFile)> {
+    ) -> Result<(
+        CPIndex,
+        Vec<parking_lot::RwLock<VantaFile>>,
+        crate::lsm::SegmentRegistry,
+    )> {
         let index_path = data_dir.join("vector_index.bin");
 
         let use_mmap = config.mmap_hnsw
@@ -311,18 +343,42 @@ impl StorageEngine {
             }
         };
 
-        let vector_store_path = data_dir.join("vector_store.vanta");
-        let vector_store = if config.read_only {
-            VantaFile::open_read_only(vector_store_path)?
-        } else {
-            VantaFile::open(vector_store_path, 64 * MIB)?
-        };
-
         if let Some(threshold) = config.flat_threshold {
             hnsw.config.flat_threshold = Some(threshold);
         }
 
-        Ok((hnsw, vector_store))
+        // Multi-level: open or create L0..L3 VantaFiles via SegmentRegistry
+        let (segment_registry, vfiles) = if config.read_only {
+            // Read-only: open each level if it exists
+            let mut reg = crate::lsm::SegmentRegistry::new();
+            let mut vfs = Vec::new();
+            for level in &[
+                SegmentLevel::L0,
+                SegmentLevel::L1,
+                SegmentLevel::L2,
+                SegmentLevel::L3,
+            ] {
+                let path = data_dir.join(level.file_name());
+                if path.exists() {
+                    let vf = VantaFile::open_read_only(path.clone())?;
+                    reg.register(level.as_u8(), level.as_u8(), path);
+                    vfs.push(parking_lot::RwLock::new(vf));
+                }
+            }
+            // Fallback: if no levels exist, open legacy path (may fail)
+            if vfs.is_empty() {
+                let legacy = data_dir.join("vector_store.vanta");
+                let vf = VantaFile::open_read_only(legacy)?;
+                let path = data_dir.join(SegmentLevel::L0.file_name());
+                reg.register(0, 0, path);
+                vfs.push(parking_lot::RwLock::new(vf));
+            }
+            (reg, vfs)
+        } else {
+            crate::lsm::SegmentRegistry::open_or_create(data_dir, &config.segment_optimizer)?
+        };
+
+        Ok((hnsw, vfiles, segment_registry))
     }
 
     fn recover_state(
@@ -330,13 +386,16 @@ impl StorageEngine {
         config: &VantaConfig,
         backend: &dyn StorageBackend,
         hnsw: &mut CPIndex,
-        vector_store: &mut VantaFile,
+        vector_store: &[parking_lot::RwLock<VantaFile>],
     ) -> Result<(u64, u64)> {
         let index_path = data_dir.join("vector_index.bin");
 
         if hnsw.nodes.is_empty() {
-            let report =
-                crate::storage::archive::rebuild_hnsw_from_vstore(hnsw, vector_store, index_path)?;
+            // Rebuild from L0 (and eventually all levels) — for now L0 is primary
+            let report = {
+                let l0_vf = vector_store[0].write();
+                crate::storage::archive::rebuild_hnsw_from_vstore(hnsw, &l0_vf, index_path)?
+            };
             crate::metrics::record_ann_rebuild(report.duration_ms, report.scanned_nodes);
             if report.scanned_nodes > 0 {
                 info!(
@@ -465,11 +524,15 @@ impl StorageEngine {
                         }
                         crate::wal::WalRecord::Delete { id } => {
                             if let Some(index_node) = hnsw.nodes.get(&id) {
-                                let offset = index_node.storage_offset;
-                                if let Some(h) = vector_store.read_header(offset) {
-                                    let mut tombstoned = h;
-                                    tombstoned.flags |= FLAG_TOMBSTONE;
-                                    vector_store.write_header(offset, &tombstoned)?;
+                                let packed_offset = index_node.storage_offset;
+                                let (seg_id, local_off) = crate::lsm::unpack_offset(packed_offset);
+                                if let Some(vs) = vector_store.get(seg_id as usize) {
+                                    let mut vstore = vs.write();
+                                    if let Some(h) = vstore.read_header(local_off) {
+                                        let mut tombstoned = h;
+                                        tombstoned.flags |= FLAG_TOMBSTONE;
+                                        vstore.write_header(local_off, &tombstoned)?;
+                                    }
                                 }
                             }
                             // PERF-23/28: Remove from HNSW graph to prevent zombie nodes

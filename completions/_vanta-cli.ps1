@@ -39,11 +39,23 @@ Register-ArgumentCompleter -Native -CommandName 'vanta-cli' -ScriptBlock {
             [CompletionResult]::new('import', 'import', [CompletionResultType]::ParameterValue, 'Import records from a JSON file')
             [CompletionResult]::new('query', 'query', [CompletionResultType]::ParameterValue, 'Execute a structured query (IQL/hybrid)')
             [CompletionResult]::new('status', 'status', [CompletionResultType]::ParameterValue, 'Display database health diagnostics and system status')
+            [CompletionResult]::new('backup', 'backup', [CompletionResultType]::ParameterValue, 'Create a filesystem-level backup of the database directory')
+            [CompletionResult]::new('restore', 'restore', [CompletionResultType]::ParameterValue, 'Restore the database from a previously created backup directory')
+            [CompletionResult]::new('doctor', 'doctor', [CompletionResultType]::ParameterValue, 'Run comprehensive health diagnostics on the database')
+            [CompletionResult]::new('inspect', 'inspect', [CompletionResultType]::ParameterValue, 'Inspect a single record showing all fields, vectors, and metadata')
+            [CompletionResult]::new('stats', 'stats', [CompletionResultType]::ParameterValue, 'Display detailed database statistics in human-readable or JSON format')
             [CompletionResult]::new('completions', 'completions', [CompletionResultType]::ParameterValue, 'Generate shell completion scripts')
             [CompletionResult]::new('search', 'search', [CompletionResultType]::ParameterValue, 'Search records semantically across a namespace')
             [CompletionResult]::new('delete', 'delete', [CompletionResultType]::ParameterValue, 'Delete a record by namespace and key')
+            [CompletionResult]::new('delete-by-filter', 'delete-by-filter', [CompletionResultType]::ParameterValue, 'Delete all records in a namespace matching a JSON metadata filter')
+            [CompletionResult]::new('count', 'count', [CompletionResultType]::ParameterValue, 'Count records in a namespace, optionally filtered by metadata')
+            [CompletionResult]::new('similar-to-key', 'similar-to-key', [CompletionResultType]::ParameterValue, 'Find records similar to a given key using vector similarity search')
             [CompletionResult]::new('migrate', 'migrate', [CompletionResultType]::ParameterValue, 'Migrate a database to the latest storage schema version')
             [CompletionResult]::new('namespace', 'namespace', [CompletionResultType]::ParameterValue, 'Manage namespaces')
+            [CompletionResult]::new('snapshot', 'snapshot', [CompletionResultType]::ParameterValue, 'Manage instant filesystem snapshots')
+            [CompletionResult]::new('wal', 'wal', [CompletionResultType]::ParameterValue, 'Manage the Write-Ahead Log (compact, vacuum)')
+            [CompletionResult]::new('search-multi', 'search-multi', [CompletionResultType]::ParameterValue, 'Search across multiple namespaces and merge results by score')
+            [CompletionResult]::new('search-all', 'search-all', [CompletionResultType]::ParameterValue, 'Search across ALL known namespaces and merge results by score')
             [CompletionResult]::new('server', 'server', [CompletionResultType]::ParameterValue, 'Start the HTTP or MCP server wrapper')
             [CompletionResult]::new('help', 'help', [CompletionResultType]::ParameterValue, 'Print this message or the help of the given subcommand(s)')
             break
@@ -153,6 +165,58 @@ Register-ArgumentCompleter -Native -CommandName 'vanta-cli' -ScriptBlock {
             [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
             break
         }
+        'vanta-cli;backup' {
+            [CompletionResult]::new('--out', '--out', [CompletionResultType]::ParameterName, 'Output directory for the backup (default: vantadb_backups/backup_<timestamp>)')
+            [CompletionResult]::new('-d', '-d', [CompletionResultType]::ParameterName, 'Path to the database directory. Defaults to the value of the VANTA_DB environment variable, or ''./db'' if neither is set')
+            [CompletionResult]::new('--db', '--db', [CompletionResultType]::ParameterName, 'Path to the database directory. Defaults to the value of the VANTA_DB environment variable, or ''./db'' if neither is set')
+            [CompletionResult]::new('-v', '-v', [CompletionResultType]::ParameterName, 'Enable verbose output')
+            [CompletionResult]::new('--verbose', '--verbose', [CompletionResultType]::ParameterName, 'Enable verbose output')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
+            break
+        }
+        'vanta-cli;restore' {
+            [CompletionResult]::new('--input', '--input', [CompletionResultType]::ParameterName, 'Path to the backup directory')
+            [CompletionResult]::new('-d', '-d', [CompletionResultType]::ParameterName, 'Path to the database directory. Defaults to the value of the VANTA_DB environment variable, or ''./db'' if neither is set')
+            [CompletionResult]::new('--db', '--db', [CompletionResultType]::ParameterName, 'Path to the database directory. Defaults to the value of the VANTA_DB environment variable, or ''./db'' if neither is set')
+            [CompletionResult]::new('--force', '--force', [CompletionResultType]::ParameterName, 'Overwrite existing database directory if it exists')
+            [CompletionResult]::new('--rebuild', '--rebuild', [CompletionResultType]::ParameterName, 'Rebuild indexes after restore')
+            [CompletionResult]::new('-v', '-v', [CompletionResultType]::ParameterName, 'Enable verbose output')
+            [CompletionResult]::new('--verbose', '--verbose', [CompletionResultType]::ParameterName, 'Enable verbose output')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
+            break
+        }
+        'vanta-cli;doctor' {
+            [CompletionResult]::new('-d', '-d', [CompletionResultType]::ParameterName, 'Path to the database directory. Defaults to the value of the VANTA_DB environment variable, or ''./db'' if neither is set')
+            [CompletionResult]::new('--db', '--db', [CompletionResultType]::ParameterName, 'Path to the database directory. Defaults to the value of the VANTA_DB environment variable, or ''./db'' if neither is set')
+            [CompletionResult]::new('-v', '-v', [CompletionResultType]::ParameterName, 'Enable verbose output')
+            [CompletionResult]::new('--verbose', '--verbose', [CompletionResultType]::ParameterName, 'Enable verbose output')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
+            break
+        }
+        'vanta-cli;inspect' {
+            [CompletionResult]::new('--namespace', '--namespace', [CompletionResultType]::ParameterName, 'Namespace of the record')
+            [CompletionResult]::new('--key', '--key', [CompletionResultType]::ParameterName, 'Key of the record to inspect')
+            [CompletionResult]::new('-d', '-d', [CompletionResultType]::ParameterName, 'Path to the database directory. Defaults to the value of the VANTA_DB environment variable, or ''./db'' if neither is set')
+            [CompletionResult]::new('--db', '--db', [CompletionResultType]::ParameterName, 'Path to the database directory. Defaults to the value of the VANTA_DB environment variable, or ''./db'' if neither is set')
+            [CompletionResult]::new('-v', '-v', [CompletionResultType]::ParameterName, 'Enable verbose output')
+            [CompletionResult]::new('--verbose', '--verbose', [CompletionResultType]::ParameterName, 'Enable verbose output')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
+            break
+        }
+        'vanta-cli;stats' {
+            [CompletionResult]::new('-d', '-d', [CompletionResultType]::ParameterName, 'Path to the database directory. Defaults to the value of the VANTA_DB environment variable, or ''./db'' if neither is set')
+            [CompletionResult]::new('--db', '--db', [CompletionResultType]::ParameterName, 'Path to the database directory. Defaults to the value of the VANTA_DB environment variable, or ''./db'' if neither is set')
+            [CompletionResult]::new('--json', '--json', [CompletionResultType]::ParameterName, 'Output statistics as JSON')
+            [CompletionResult]::new('-v', '-v', [CompletionResultType]::ParameterName, 'Enable verbose output')
+            [CompletionResult]::new('--verbose', '--verbose', [CompletionResultType]::ParameterName, 'Enable verbose output')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
+            break
+        }
         'vanta-cli;completions' {
             [CompletionResult]::new('--shell', '--shell', [CompletionResultType]::ParameterName, 'Shell type for the completion script')
             [CompletionResult]::new('-d', '-d', [CompletionResultType]::ParameterName, 'Path to the database directory. Defaults to the value of the VANTA_DB environment variable, or ''./db'' if neither is set')
@@ -182,6 +246,42 @@ Register-ArgumentCompleter -Native -CommandName 'vanta-cli' -ScriptBlock {
             [CompletionResult]::new('--key', '--key', [CompletionResultType]::ParameterName, 'Key of the record to delete')
             [CompletionResult]::new('-d', '-d', [CompletionResultType]::ParameterName, 'Path to the database directory. Defaults to the value of the VANTA_DB environment variable, or ''./db'' if neither is set')
             [CompletionResult]::new('--db', '--db', [CompletionResultType]::ParameterName, 'Path to the database directory. Defaults to the value of the VANTA_DB environment variable, or ''./db'' if neither is set')
+            [CompletionResult]::new('-v', '-v', [CompletionResultType]::ParameterName, 'Enable verbose output')
+            [CompletionResult]::new('--verbose', '--verbose', [CompletionResultType]::ParameterName, 'Enable verbose output')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
+            break
+        }
+        'vanta-cli;delete-by-filter' {
+            [CompletionResult]::new('--namespace', '--namespace', [CompletionResultType]::ParameterName, 'Namespace to operate on')
+            [CompletionResult]::new('--filter', '--filter', [CompletionResultType]::ParameterName, 'JSON filter in MongoDB-like format, e.g. ''{"field": {"$op": value}}'' Operators: $eq, $neq, $gt, $gte, $lt, $lte Example: ''{"status": {"$eq": "inactive"}}''')
+            [CompletionResult]::new('-d', '-d', [CompletionResultType]::ParameterName, 'Path to the database directory. Defaults to the value of the VANTA_DB environment variable, or ''./db'' if neither is set')
+            [CompletionResult]::new('--db', '--db', [CompletionResultType]::ParameterName, 'Path to the database directory. Defaults to the value of the VANTA_DB environment variable, or ''./db'' if neither is set')
+            [CompletionResult]::new('-v', '-v', [CompletionResultType]::ParameterName, 'Enable verbose output')
+            [CompletionResult]::new('--verbose', '--verbose', [CompletionResultType]::ParameterName, 'Enable verbose output')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
+            break
+        }
+        'vanta-cli;count' {
+            [CompletionResult]::new('--namespace', '--namespace', [CompletionResultType]::ParameterName, 'Namespace to count records in')
+            [CompletionResult]::new('--filter', '--filter', [CompletionResultType]::ParameterName, 'Optional JSON filter (same format as delete-by-filter)')
+            [CompletionResult]::new('-d', '-d', [CompletionResultType]::ParameterName, 'Path to the database directory. Defaults to the value of the VANTA_DB environment variable, or ''./db'' if neither is set')
+            [CompletionResult]::new('--db', '--db', [CompletionResultType]::ParameterName, 'Path to the database directory. Defaults to the value of the VANTA_DB environment variable, or ''./db'' if neither is set')
+            [CompletionResult]::new('--json', '--json', [CompletionResultType]::ParameterName, 'Output as raw number only')
+            [CompletionResult]::new('-v', '-v', [CompletionResultType]::ParameterName, 'Enable verbose output')
+            [CompletionResult]::new('--verbose', '--verbose', [CompletionResultType]::ParameterName, 'Enable verbose output')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
+            break
+        }
+        'vanta-cli;similar-to-key' {
+            [CompletionResult]::new('--namespace', '--namespace', [CompletionResultType]::ParameterName, 'Namespace of the reference record')
+            [CompletionResult]::new('--key', '--key', [CompletionResultType]::ParameterName, 'Key of the reference record')
+            [CompletionResult]::new('--top-k', '--top-k', [CompletionResultType]::ParameterName, 'Number of similar records to return')
+            [CompletionResult]::new('-d', '-d', [CompletionResultType]::ParameterName, 'Path to the database directory. Defaults to the value of the VANTA_DB environment variable, or ''./db'' if neither is set')
+            [CompletionResult]::new('--db', '--db', [CompletionResultType]::ParameterName, 'Path to the database directory. Defaults to the value of the VANTA_DB environment variable, or ''./db'' if neither is set')
+            [CompletionResult]::new('--json', '--json', [CompletionResultType]::ParameterName, 'Output in JSON format')
             [CompletionResult]::new('-v', '-v', [CompletionResultType]::ParameterName, 'Enable verbose output')
             [CompletionResult]::new('--verbose', '--verbose', [CompletionResultType]::ParameterName, 'Enable verbose output')
             [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help')
@@ -295,6 +395,123 @@ Register-ArgumentCompleter -Native -CommandName 'vanta-cli' -ScriptBlock {
         'vanta-cli;namespace;help;help' {
             break
         }
+        'vanta-cli;snapshot' {
+            [CompletionResult]::new('-d', '-d', [CompletionResultType]::ParameterName, 'Path to the database directory. Defaults to the value of the VANTA_DB environment variable, or ''./db'' if neither is set')
+            [CompletionResult]::new('--db', '--db', [CompletionResultType]::ParameterName, 'Path to the database directory. Defaults to the value of the VANTA_DB environment variable, or ''./db'' if neither is set')
+            [CompletionResult]::new('-v', '-v', [CompletionResultType]::ParameterName, 'Enable verbose output')
+            [CompletionResult]::new('--verbose', '--verbose', [CompletionResultType]::ParameterName, 'Enable verbose output')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
+            [CompletionResult]::new('create', 'create', [CompletionResultType]::ParameterValue, 'Create an instant filesystem snapshot by hard-linking all data files')
+            [CompletionResult]::new('list', 'list', [CompletionResultType]::ParameterValue, 'List all existing snapshots')
+            [CompletionResult]::new('help', 'help', [CompletionResultType]::ParameterValue, 'Print this message or the help of the given subcommand(s)')
+            break
+        }
+        'vanta-cli;snapshot;create' {
+            [CompletionResult]::new('-d', '-d', [CompletionResultType]::ParameterName, 'Path to the database directory. Defaults to the value of the VANTA_DB environment variable, or ''./db'' if neither is set')
+            [CompletionResult]::new('--db', '--db', [CompletionResultType]::ParameterName, 'Path to the database directory. Defaults to the value of the VANTA_DB environment variable, or ''./db'' if neither is set')
+            [CompletionResult]::new('-v', '-v', [CompletionResultType]::ParameterName, 'Enable verbose output')
+            [CompletionResult]::new('--verbose', '--verbose', [CompletionResultType]::ParameterName, 'Enable verbose output')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
+            break
+        }
+        'vanta-cli;snapshot;list' {
+            [CompletionResult]::new('-d', '-d', [CompletionResultType]::ParameterName, 'Path to the database directory. Defaults to the value of the VANTA_DB environment variable, or ''./db'' if neither is set')
+            [CompletionResult]::new('--db', '--db', [CompletionResultType]::ParameterName, 'Path to the database directory. Defaults to the value of the VANTA_DB environment variable, or ''./db'' if neither is set')
+            [CompletionResult]::new('-v', '-v', [CompletionResultType]::ParameterName, 'Enable verbose output')
+            [CompletionResult]::new('--verbose', '--verbose', [CompletionResultType]::ParameterName, 'Enable verbose output')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
+            break
+        }
+        'vanta-cli;snapshot;help' {
+            [CompletionResult]::new('create', 'create', [CompletionResultType]::ParameterValue, 'Create an instant filesystem snapshot by hard-linking all data files')
+            [CompletionResult]::new('list', 'list', [CompletionResultType]::ParameterValue, 'List all existing snapshots')
+            [CompletionResult]::new('help', 'help', [CompletionResultType]::ParameterValue, 'Print this message or the help of the given subcommand(s)')
+            break
+        }
+        'vanta-cli;snapshot;help;create' {
+            break
+        }
+        'vanta-cli;snapshot;help;list' {
+            break
+        }
+        'vanta-cli;snapshot;help;help' {
+            break
+        }
+        'vanta-cli;wal' {
+            [CompletionResult]::new('-d', '-d', [CompletionResultType]::ParameterName, 'Path to the database directory. Defaults to the value of the VANTA_DB environment variable, or ''./db'' if neither is set')
+            [CompletionResult]::new('--db', '--db', [CompletionResultType]::ParameterName, 'Path to the database directory. Defaults to the value of the VANTA_DB environment variable, or ''./db'' if neither is set')
+            [CompletionResult]::new('-v', '-v', [CompletionResultType]::ParameterName, 'Enable verbose output')
+            [CompletionResult]::new('--verbose', '--verbose', [CompletionResultType]::ParameterName, 'Enable verbose output')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
+            [CompletionResult]::new('compact', 'compact', [CompletionResultType]::ParameterValue, 'Compact the WAL: flush all data, archive the current WAL file, and start a fresh one')
+            [CompletionResult]::new('vacuum', 'vacuum', [CompletionResultType]::ParameterValue, 'Remove tombstoned nodes from HNSW and reclaim space')
+            [CompletionResult]::new('help', 'help', [CompletionResultType]::ParameterValue, 'Print this message or the help of the given subcommand(s)')
+            break
+        }
+        'vanta-cli;wal;compact' {
+            [CompletionResult]::new('-d', '-d', [CompletionResultType]::ParameterName, 'Path to the database directory. Defaults to the value of the VANTA_DB environment variable, or ''./db'' if neither is set')
+            [CompletionResult]::new('--db', '--db', [CompletionResultType]::ParameterName, 'Path to the database directory. Defaults to the value of the VANTA_DB environment variable, or ''./db'' if neither is set')
+            [CompletionResult]::new('-v', '-v', [CompletionResultType]::ParameterName, 'Enable verbose output')
+            [CompletionResult]::new('--verbose', '--verbose', [CompletionResultType]::ParameterName, 'Enable verbose output')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
+            break
+        }
+        'vanta-cli;wal;vacuum' {
+            [CompletionResult]::new('-d', '-d', [CompletionResultType]::ParameterName, 'Path to the database directory. Defaults to the value of the VANTA_DB environment variable, or ''./db'' if neither is set')
+            [CompletionResult]::new('--db', '--db', [CompletionResultType]::ParameterName, 'Path to the database directory. Defaults to the value of the VANTA_DB environment variable, or ''./db'' if neither is set')
+            [CompletionResult]::new('-v', '-v', [CompletionResultType]::ParameterName, 'Enable verbose output')
+            [CompletionResult]::new('--verbose', '--verbose', [CompletionResultType]::ParameterName, 'Enable verbose output')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
+            break
+        }
+        'vanta-cli;wal;help' {
+            [CompletionResult]::new('compact', 'compact', [CompletionResultType]::ParameterValue, 'Compact the WAL: flush all data, archive the current WAL file, and start a fresh one')
+            [CompletionResult]::new('vacuum', 'vacuum', [CompletionResultType]::ParameterValue, 'Remove tombstoned nodes from HNSW and reclaim space')
+            [CompletionResult]::new('help', 'help', [CompletionResultType]::ParameterValue, 'Print this message or the help of the given subcommand(s)')
+            break
+        }
+        'vanta-cli;wal;help;compact' {
+            break
+        }
+        'vanta-cli;wal;help;vacuum' {
+            break
+        }
+        'vanta-cli;wal;help;help' {
+            break
+        }
+        'vanta-cli;search-multi' {
+            [CompletionResult]::new('--namespaces', '--namespaces', [CompletionResultType]::ParameterName, 'Comma-separated list of namespaces to search (e.g. "ns1,ns2,ns3")')
+            [CompletionResult]::new('--query', '--query', [CompletionResultType]::ParameterName, 'Text query for hybrid/lexical search')
+            [CompletionResult]::new('--query-vector', '--query-vector', [CompletionResultType]::ParameterName, 'Optional explicit vector query (comma-separated f32 values)')
+            [CompletionResult]::new('--top-k', '--top-k', [CompletionResultType]::ParameterName, 'Maximum number of results across all namespaces')
+            [CompletionResult]::new('-d', '-d', [CompletionResultType]::ParameterName, 'Path to the database directory. Defaults to the value of the VANTA_DB environment variable, or ''./db'' if neither is set')
+            [CompletionResult]::new('--db', '--db', [CompletionResultType]::ParameterName, 'Path to the database directory. Defaults to the value of the VANTA_DB environment variable, or ''./db'' if neither is set')
+            [CompletionResult]::new('--json', '--json', [CompletionResultType]::ParameterName, 'Output in JSON format')
+            [CompletionResult]::new('-v', '-v', [CompletionResultType]::ParameterName, 'Enable verbose output')
+            [CompletionResult]::new('--verbose', '--verbose', [CompletionResultType]::ParameterName, 'Enable verbose output')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
+            break
+        }
+        'vanta-cli;search-all' {
+            [CompletionResult]::new('--query', '--query', [CompletionResultType]::ParameterName, 'Text query for hybrid/lexical search')
+            [CompletionResult]::new('--query-vector', '--query-vector', [CompletionResultType]::ParameterName, 'Optional explicit vector query (comma-separated f32 values)')
+            [CompletionResult]::new('--top-k', '--top-k', [CompletionResultType]::ParameterName, 'Maximum number of results across all namespaces')
+            [CompletionResult]::new('-d', '-d', [CompletionResultType]::ParameterName, 'Path to the database directory. Defaults to the value of the VANTA_DB environment variable, or ''./db'' if neither is set')
+            [CompletionResult]::new('--db', '--db', [CompletionResultType]::ParameterName, 'Path to the database directory. Defaults to the value of the VANTA_DB environment variable, or ''./db'' if neither is set')
+            [CompletionResult]::new('--json', '--json', [CompletionResultType]::ParameterName, 'Output in JSON format')
+            [CompletionResult]::new('-v', '-v', [CompletionResultType]::ParameterName, 'Enable verbose output')
+            [CompletionResult]::new('--verbose', '--verbose', [CompletionResultType]::ParameterName, 'Enable verbose output')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
+            break
+        }
         'vanta-cli;server' {
             [CompletionResult]::new('-p', '-p', [CompletionResultType]::ParameterName, 'Port for the HTTP server')
             [CompletionResult]::new('--port', '--port', [CompletionResultType]::ParameterName, 'Port for the HTTP server')
@@ -321,11 +538,23 @@ Register-ArgumentCompleter -Native -CommandName 'vanta-cli' -ScriptBlock {
             [CompletionResult]::new('import', 'import', [CompletionResultType]::ParameterValue, 'Import records from a JSON file')
             [CompletionResult]::new('query', 'query', [CompletionResultType]::ParameterValue, 'Execute a structured query (IQL/hybrid)')
             [CompletionResult]::new('status', 'status', [CompletionResultType]::ParameterValue, 'Display database health diagnostics and system status')
+            [CompletionResult]::new('backup', 'backup', [CompletionResultType]::ParameterValue, 'Create a filesystem-level backup of the database directory')
+            [CompletionResult]::new('restore', 'restore', [CompletionResultType]::ParameterValue, 'Restore the database from a previously created backup directory')
+            [CompletionResult]::new('doctor', 'doctor', [CompletionResultType]::ParameterValue, 'Run comprehensive health diagnostics on the database')
+            [CompletionResult]::new('inspect', 'inspect', [CompletionResultType]::ParameterValue, 'Inspect a single record showing all fields, vectors, and metadata')
+            [CompletionResult]::new('stats', 'stats', [CompletionResultType]::ParameterValue, 'Display detailed database statistics in human-readable or JSON format')
             [CompletionResult]::new('completions', 'completions', [CompletionResultType]::ParameterValue, 'Generate shell completion scripts')
             [CompletionResult]::new('search', 'search', [CompletionResultType]::ParameterValue, 'Search records semantically across a namespace')
             [CompletionResult]::new('delete', 'delete', [CompletionResultType]::ParameterValue, 'Delete a record by namespace and key')
+            [CompletionResult]::new('delete-by-filter', 'delete-by-filter', [CompletionResultType]::ParameterValue, 'Delete all records in a namespace matching a JSON metadata filter')
+            [CompletionResult]::new('count', 'count', [CompletionResultType]::ParameterValue, 'Count records in a namespace, optionally filtered by metadata')
+            [CompletionResult]::new('similar-to-key', 'similar-to-key', [CompletionResultType]::ParameterValue, 'Find records similar to a given key using vector similarity search')
             [CompletionResult]::new('migrate', 'migrate', [CompletionResultType]::ParameterValue, 'Migrate a database to the latest storage schema version')
             [CompletionResult]::new('namespace', 'namespace', [CompletionResultType]::ParameterValue, 'Manage namespaces')
+            [CompletionResult]::new('snapshot', 'snapshot', [CompletionResultType]::ParameterValue, 'Manage instant filesystem snapshots')
+            [CompletionResult]::new('wal', 'wal', [CompletionResultType]::ParameterValue, 'Manage the Write-Ahead Log (compact, vacuum)')
+            [CompletionResult]::new('search-multi', 'search-multi', [CompletionResultType]::ParameterValue, 'Search across multiple namespaces and merge results by score')
+            [CompletionResult]::new('search-all', 'search-all', [CompletionResultType]::ParameterValue, 'Search across ALL known namespaces and merge results by score')
             [CompletionResult]::new('server', 'server', [CompletionResultType]::ParameterValue, 'Start the HTTP or MCP server wrapper')
             [CompletionResult]::new('help', 'help', [CompletionResultType]::ParameterValue, 'Print this message or the help of the given subcommand(s)')
             break
@@ -360,6 +589,21 @@ Register-ArgumentCompleter -Native -CommandName 'vanta-cli' -ScriptBlock {
         'vanta-cli;help;status' {
             break
         }
+        'vanta-cli;help;backup' {
+            break
+        }
+        'vanta-cli;help;restore' {
+            break
+        }
+        'vanta-cli;help;doctor' {
+            break
+        }
+        'vanta-cli;help;inspect' {
+            break
+        }
+        'vanta-cli;help;stats' {
+            break
+        }
         'vanta-cli;help;completions' {
             break
         }
@@ -367,6 +611,15 @@ Register-ArgumentCompleter -Native -CommandName 'vanta-cli' -ScriptBlock {
             break
         }
         'vanta-cli;help;delete' {
+            break
+        }
+        'vanta-cli;help;delete-by-filter' {
+            break
+        }
+        'vanta-cli;help;count' {
+            break
+        }
+        'vanta-cli;help;similar-to-key' {
             break
         }
         'vanta-cli;help;migrate' {
@@ -393,6 +646,34 @@ Register-ArgumentCompleter -Native -CommandName 'vanta-cli' -ScriptBlock {
             break
         }
         'vanta-cli;help;namespace;info' {
+            break
+        }
+        'vanta-cli;help;snapshot' {
+            [CompletionResult]::new('create', 'create', [CompletionResultType]::ParameterValue, 'Create an instant filesystem snapshot by hard-linking all data files')
+            [CompletionResult]::new('list', 'list', [CompletionResultType]::ParameterValue, 'List all existing snapshots')
+            break
+        }
+        'vanta-cli;help;snapshot;create' {
+            break
+        }
+        'vanta-cli;help;snapshot;list' {
+            break
+        }
+        'vanta-cli;help;wal' {
+            [CompletionResult]::new('compact', 'compact', [CompletionResultType]::ParameterValue, 'Compact the WAL: flush all data, archive the current WAL file, and start a fresh one')
+            [CompletionResult]::new('vacuum', 'vacuum', [CompletionResultType]::ParameterValue, 'Remove tombstoned nodes from HNSW and reclaim space')
+            break
+        }
+        'vanta-cli;help;wal;compact' {
+            break
+        }
+        'vanta-cli;help;wal;vacuum' {
+            break
+        }
+        'vanta-cli;help;search-multi' {
+            break
+        }
+        'vanta-cli;help;search-all' {
             break
         }
         'vanta-cli;help;server' {

@@ -10,6 +10,7 @@
 use core::sync::atomic::{AtomicBool, Ordering};
 use serde::{Deserialize, Serialize};
 use vantadb::config::VantaConfig;
+use vantadb::graph::TraversalDirection;
 use vantadb::sdk::*;
 use vantadb::BackendKind;
 use vantadb::VantaError;
@@ -407,7 +408,9 @@ impl VantaDB {
             let mut cursor: Option<usize> = None;
             loop {
                 let opts = VantaMemoryListOptions {
+                    #[allow(deprecated)]
                     filters: VantaMemoryMetadata::new(),
+                    filter_ops: None,
                     limit: 10_000,
                     cursor,
                 };
@@ -589,7 +592,9 @@ impl VantaDB {
     pub fn list(&self, namespace: &str, options: JsValue) -> Result<JsValue, JsValue> {
         let opts: ListOptions = from_js(options)?;
         let vanta_opts = VantaMemoryListOptions {
+            #[allow(deprecated)]
             filters: opts.filters,
+            filter_ops: None,
             limit: opts.limit,
             cursor: opts.cursor,
         };
@@ -748,9 +753,43 @@ impl VantaDB {
         to_js(&report)
     }
 
+    /// Bulk-import records from a binary .vdbdump file.
+    /// Returns a report object with total_records, batches_committed, duration_ms.
+    pub fn bulk_import(&self, path: &str) -> Result<JsValue, JsValue> {
+        let report = self.inner.bulk_import_file(path).map_err(to_js_err)?;
+        to_js(&report)
+    }
+
+    /// Bulk-import records from binary bytes (.vdbdump format).
+    /// Accepts a Uint8Array and returns a report object.
+    pub fn bulk_import_bytes(&self, data: &[u8]) -> Result<JsValue, JsValue> {
+        let mut cursor = std::io::Cursor::new(data);
+        let report = self
+            .inner
+            .bulk_import_stream(&mut cursor)
+            .map_err(to_js_err)?;
+        to_js(&report)
+    }
+
     /// Rebuild the HNSW index and return a rebuild report.
     pub fn rebuild_index(&self) -> Result<JsValue, JsValue> {
         let report = self.inner.rebuild_index().map_err(to_js_err)?;
+        to_js(&report)
+    }
+
+    /// Paginated HNSW rebuild from text records.
+    ///
+    /// Iterates through memory records in batches (max 1000) using the
+    /// cursor-based list() API to prevent OOM on large namespaces.
+    pub fn reindex_hnsw_from_text(
+        &self,
+        namespace: &str,
+        page_size: Option<usize>,
+    ) -> Result<JsValue, JsValue> {
+        let report = self
+            .inner
+            .reindex_hnsw_from_text(namespace, page_size)
+            .map_err(to_js_err)?;
         to_js(&report)
     }
 
@@ -868,16 +907,52 @@ impl VantaDB {
     }
 
     /// Perform a breadth-first traversal from the given root node IDs.
-    pub fn graph_bfs(&self, roots: Vec<u64>, max_depth: usize) -> Result<JsValue, JsValue> {
+    pub fn graph_bfs(
+        &self,
+        roots: Vec<u64>,
+        max_depth: usize,
+        direction: String,
+    ) -> Result<JsValue, JsValue> {
+        let dir = match direction.as_str() {
+            "Forward" => TraversalDirection::Forward,
+            "Reverse" => TraversalDirection::Reverse,
+            "Both" => TraversalDirection::Both,
+            _ => {
+                return Err(JsValue::from_str(&format!(
+                    "invalid direction '{direction}': expected 'Forward', 'Reverse', or 'Both'"
+                )))
+            }
+        };
         let roots: Vec<u128> = roots.into_iter().map(|r| r.into()).collect();
-        let result = self.inner.graph_bfs(&roots, max_depth).map_err(to_js_err)?;
+        let result = self
+            .inner
+            .graph_bfs(&roots, max_depth, dir)
+            .map_err(to_js_err)?;
         to_js(&result)
     }
 
     /// Perform a depth-first traversal from the given root node IDs.
-    pub fn graph_dfs(&self, roots: Vec<u64>, max_depth: usize) -> Result<JsValue, JsValue> {
+    pub fn graph_dfs(
+        &self,
+        roots: Vec<u64>,
+        max_depth: usize,
+        direction: String,
+    ) -> Result<JsValue, JsValue> {
+        let dir = match direction.as_str() {
+            "Forward" => TraversalDirection::Forward,
+            "Reverse" => TraversalDirection::Reverse,
+            "Both" => TraversalDirection::Both,
+            _ => {
+                return Err(JsValue::from_str(&format!(
+                    "invalid direction '{direction}': expected 'Forward', 'Reverse', or 'Both'"
+                )))
+            }
+        };
         let roots: Vec<u128> = roots.into_iter().map(|r| r.into()).collect();
-        let result = self.inner.graph_dfs(&roots, max_depth).map_err(to_js_err)?;
+        let result = self
+            .inner
+            .graph_dfs(&roots, max_depth, dir)
+            .map_err(to_js_err)?;
         to_js(&result)
     }
 

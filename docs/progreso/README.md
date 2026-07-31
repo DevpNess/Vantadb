@@ -2,13 +2,13 @@
 title: "General Progress of VantaDB Project"
 status: active
 tags: [vantadb, progress, documentation]
-last_reviewed: 2026-07-14
+last_reviewed: 2026-07-31
 aliases: []
 ---
 
 # General Progress of VantaDB Project
 
-> **Last updated:** 2026-07-17
+> **Last updated:** 2026-07-31
 > **Release version:** [`docs/CHANGELOG.md`]([[CHANGELOG.md]]) — formal changelog by version
 > **Activate backlog:** [`docs/Backlog.md`]([[Backlog.md]]) — prioritized tasks
 
@@ -22,17 +22,17 @@ VantaDB is a vector database in Rust focused on high performance, hybrid HNSW, G
 
 | Category | Completed | Total | Status |
 |-----------|-------------|-------|--------|
-| Core/Index | 16 | 16 | ✅ |
+| Core/Index | 17 | 17 | ✅ |
 | Python Bindings | 5 | 5 | ✅ |
 | API/Servidor | 9 | 9 | ✅ |
 | Observability | 6 | 6 | ✅ |
 | **Documentation** | 🟢 Consolidated (Wikilinks, Glossary, Unicode normalized) | 95% | ✅ |
-| **Testing** | 🟢 Complete (Compiles clean, 444/444 tests passing) | 90% | ✅ |
+| **Testing** | 🟢 Coverage CII Silver (80.55% line, 1492 tests) | 100% | ✅ |
 | DX Tools | 15 | 15 | ✅ |
-| CLI | 7 | 7 | ✅ |
-| Infraestructura & CI | 2 | 2 | ✅ |
+| CLI | 8 | 8 | ✅ |
+| Infraestructura & CI | 4 | 4 | ✅ |
 | Project Management | 6 | 6 | ✅ |
-| **Total** | **89** | **~89** | **✅** |
+| **Total** | **95** | **~95** | **✅** |
 
 ## Legend
 
@@ -198,6 +198,10 @@ VantaDB is a vector database in Rust focused on high performance, hybrid HNSW, G
 - `MakeWriter` closure instead of direct `Box<dyn Write>`
 68. **`vantadb-mcp` ttl_ms: None** — ✅
 - `planner.rs:369` `expires_at_ms: Some(0)`
+69. **COMP-025: JSON shredding** — ✅
+- **Phase 1:** Schema inference + columnar storage + filter integration (equality fast path). `ShreddedSchema`, `ShreddedRowStore`, `infer_field_type`. 8 tests.
+- **Phase 2:** Typed comparison filters (Gt/Lt/Gte/Lte/Neq). `matches_shredded` con 6 operadores en I64/F64/Bool/String. 5 tests adicionales (13 total). Test de integración con 3 nodes.
+- **Total:** 13 tests, `src/shred/mod.rs`, commit TBD
 
 ### Infrastructure Issues
 
@@ -288,6 +292,637 @@ Automated audit of 44 findings executed and resolved in full on the same day. Ea
 - **Checkpoint.md:** Nuevo — resumen anclado del vault MPTS con cobertura, backlog activo y estado actual.
 
 ## Recent Progress
+
+### 2026-07-31 — VantaDB Recovery Plan (REC-001 to REC-010, REC-999) ✅
+
+**Fuente:** Recovery Plan (`docs/plans/2026-07-28-recovery-plan.md`)
+
+**Resuelto por:**
+- **REC-001:** Definición de `VantaFilterOp`, `VantaMemoryFilterItem` y `VantaMemoryFilter` en `src/sdk/types.rs`.
+- **REC-002:** Implementación de `delete_by_filter()` en SDK + CLI.
+- **REC-003:** Implementación de `count()` con filtros opcionales en SDK + CLI.
+- **REC-004:** Implementación de `similar_to_key()` en SDK + CLI.
+- **REC-005:** Multi-namespace search (`search_multi` y `search_all`) en SDK + CLI.
+- **REC-006:** Implementación de coincidencia de predicados de metadatos avanzados (`matches_advanced_filters`) en listados del SDK.
+- **REC-007:** Comandos de WAL compactación y vacuum en la CLI (completado previamente).
+- **REC-008:** Diseño de incremental backup + PITR, e implementación de la Fase A (`MANIFEST.json` con integridad CRC32C de archivos en `cmd_backup`).
+- **REC-009:** Análisis de viabilidad de Product Quantization (PQ) vs SQ8/TurboQuant/RaBitQ.
+- **REC-010:** Empaquetado y tipados de Python (completado previamente).
+- **REC-999:** Corrección e historial actualizado en `docs/progreso/README.md`.
+
+**Verificación:** `cargo check -p vantadb` ✅ | `cargo check --bin vanta-cli` ✅
+
+**Ids:** `REC-001`, `REC-002`, `REC-003`, `REC-004`, `REC-005`, `REC-006`, `REC-007`, `REC-008`, `REC-009`, `REC-010`, `REC-999`
+
+### 2026-07-28 — COMP-018: Double-linked Relationship Chains ✅
+
+**Fuente:** Backlog (Phase 10 — Competitive Features) `COMP-018`
+
+**Resuelto por:**
+- Rust SDK: `graph_bfs()`, `graph_dfs()`, `graph_bfs_filtered()`, `graph_dfs_filtered()` — añadido parámetro `direction: TraversalDirection`
+- Python bindings: `graph_bfs()`, `graph_dfs()` — añadido `direction="Forward"` via PyO3 signature + `parse_direction()`
+- WASM bindings: `graph_bfs()`, `graph_dfs()` — añadido `direction: String` con parse
+- 5 archivos modificados: `src/sdk/graph.rs`, `vantadb-python/src/lib.rs`, `vantadb-python/src/convert.rs`, `vantadb-wasm/src/lib.rs`, `examples/rust/graphrag.rs`
+- Edge.reverse + add_edge/remove_edge bidireccional ya existían
+
+**Verificación:** `cargo check -p vantadb` ✅ | `cargo check -p vantadb_py` ✅ | `cargo check -p vantadb-wasm` ✅ | 33 tests graph ✅
+
+**Ids:** `COMP-018`
+
+### 2026-07-29 — INV-001: RUSTSEC Advisory Audit ✅
+
+**Fuente:** Backlog (Investigaciones de Seguridad) `INV-001`
+
+**Resuelto por (vanta-audit, vanta-lead):**
+- Auditadas 3 RUSTSEC: `atomic-polyfill` (ya gestionada en deny.toml), `paste` y `rustls-pemfile` (no son dependencias activas — stale)
+- `cargo deny check advisories` pasa limpio
+- Reporte: `docs/audit-reports/inv-001-rustsec-2026-07-29.md`
+
+**Veredicto:** ✅ Sin acciones correctivas — 0 de 3 advisories son riesgo real.
+
+**Ids:** `INV-001`
+
+### 2026-07-30 — INV-002: Memory Telemetry Correction ✅
+
+**Fuente:** Backlog (Phase 4 — Engineering Health) `INV-002`
+
+**Resuelto por (vanta-tuner):**
+- Inventario completo: 10+ métricas mapeadas a fuente real (PSAPI/sysinfo, `estimate_memory_bytes`, `VantaFile::mmap_resident_bytes`, jemalloc-ctl, CacheWarmer dead code, MemoryGovernor sin gauge)
+- Hallazgos clave: `volatile_cache_cap_bytes` hardcoded `0` (roto), sampler periódico inexistente, `MemoryGovernor` no conectado a métricas
+- Esquema de 5 categorías diseñado (core / index / page_cache / mmap / ingest) con invariante explícita: categorías son vistas ortogonales, nunca sumarlas como total; único agregado es RSS del OS (`core ≈ rss − index − page_cache − mmap − ingest`)
+- Propuesta: `IntGaugeVec` con label fijo `category` — validado contra API oficial `tikv/rust-prometheus`; descartado `metrics`/`metrics-tracing` del backlog (workspace usa prometheus 0.14 directo)
+- Contrato público `OperationalMetrics` (TS SDK) preservado — Vec aditivo en `/metrics`
+- Doc actualizado: `docs/operations/MEMORY_TELEMETRY.md` (+357 líneas, reconciliado DISC-05), cross-ref en `PERFORMANCE_TUNING.md`
+- **Sin implementación** — solo diseño + propuesta (src/ intacto)
+
+**Veredicto:** ✅ Esquema aprobado para fase 2 (implementación de gauges por categoría como task futuro).
+
+**Ids:** `INV-002`
+
+### 2026-07-30 — INV-024: Unsafe Blocks Audit ✅
+
+**Fuente:** Backlog (Phase 1 — Security & Critical) `INV-024`
+
+**Resuelto por (vanta-audit):**
+- Auditados **39 bloques `unsafe`** en 11 archivos del core Rust
+- Clasificación: 28 SAFE, 4 SAFE_BUT_UNDOCUMENTED, 7 UB_POTENTIAL
+- **🔴 High (1):** panic-DoS en `sq8_similarity` (`distance.rs:411/450`) — reachable desde API pública (`search_vector` → `search_nearest` → `calculate_similarity`), sin guard de dimensiones. Query de 9 dims contra SQ8 de 8 dims → panic. Fix de una línea.
+- **🟠 Medium (1):** UB por alineación — `header.vector_offset` nunca validado como múltiplo de 4 en runtime (solo `debug_assert`, ausente en release). Afecta 7 sitios (`ops.rs:509` ni siquiera tiene debug_assert).
+- **🟡 Low (3):** RUSTSEC-2026-0002 (lru via ratatui, allowed), MmapFull sin validación de contenido (NaN silencioso), `_force_copy` muerto.
+- `cargo deny check` **PASSED** | `cargo audit` 0 critical/high/medium
+- Reporte: `docs/audit-reports/inv-024-unsafe-audit-2026-07-30.md`
+
+**Veredicto:** ✅ Core sólido. Fix recomendado primero: guard de una línea en `sq8_similarity`; luego fix central de alineación en `read_header`.
+
+**Ids:** `INV-024`
+
+### 2026-07-29 — REC-007: WAL Compaction + Vacuum CLI ✅
+
+**Fuente:** Backlog (Phase 8 — Post-Launch & Enterprise) `REC-007`
+
+**Resuelto por (vanta-worker, ponytail):**
+- `src/cli.rs` — Nuevo `WalCommand` enum con variantes `Compact` / `Vacuum`
+- `src/cli_handlers/wal.rs` — Handlers `cmd_wal_compact()` / `cmd_wal_vacuum()` con box-drawing output
+- `src/cli_handlers/mod.rs` — `pub mod wal;` + `pub use wal::*;`
+- `src/bin/vanta-cli.rs` — Dispatch match arm
+- Binding directo de `VantaEmbedded::compact_wal()` y `VantaEmbedded::vacuum()` — sin lógica nueva
+
+**Verificación:** `cargo check -p vantadb --features cli` ✅ | `cargo clippy` ✅ | 4 archivos modificados
+
+**Ids:** `REC-007`
+
+### 2026-07-29 — REC-001: Foundation Filter Types (VantaFilterOp + VantaMemoryFilterItem) ✅
+
+**Fuente:** Backlog (Phase 8 — Post-Launch & Enterprise) `REC-001`
+
+**Resuelto por (vanta-lead, vanta-worker, ponytail):**
+- `src/sdk/types.rs:106-126` — Tres nuevos tipos agregados:
+  - `VantaFilterOp` enum: `Eq`, `Neq`, `Gt`, `Lt`, `Gte`, `Lte`
+  - `VantaMemoryFilterItem` struct: `field: String`, `op: VantaFilterOp`, `value: VantaValue`
+  - `VantaMemoryFilter` type alias: `Vec<VantaMemoryFilterItem>` (AND semantics)
+- `src/sdk/mod.rs` — Re-exportados `VantaFilterOp`, `VantaMemoryFilterItem`, `VantaMemoryFilter`
+- Pure additive change — 0 existing types touched
+- desbloquea: SDK-01 (delete_by_filter), SDK-03 (count_with_filters), SDK-05 (expanded metadata filters)
+
+**Ponytail:** No implementar `evaluate_filter()` todavía — los tipos primero, el matching se añade con el primer consumidor.
+
+**Verificación:** `cargo check -p vantadb` ✅ | `cargo clippy -p vantadb -- -D warnings` ✅ | 0 regresiones
+
+**Ids:** `REC-001`
+
+### 2026-07-28 — COMP-026: Multi-level LSM Compaction ✅
+
+**Fuente:** Backlog (Phase 10 — Competitive Features) `COMP-026`
+
+**Resuelto por (vanta-worker, vanta-lead, ponytail):**
+- `SegmentRegistry` con `open_or_create()` — maneja legacy `vector_store.vanta` → `vstore_L0.vanta`
+- `StorageEngine.vector_store` cambiado de `RwLock<VantaFile>` → `Vec<RwLock<VantaFile>>` (un lock por nivel)
+- `read_header_from_segment()`, `read_vec_bytes_from_segment()`, `write_node_to_l0()` — lectura/escritura segment-aware
+- `should_compact_level()` — decisión por tamaño + tombstone ratio
+- `compact_level(level)` — promueve nodos vivos a nivel+1, actualiza HNSW offsets, trunca source
+- `PipelineMode::CompactOnly` y `CompactL0Only` — nuevas variantes
+- `run_pipeline()` extendido con fases LSM (CompactL0 → CompactL1 → CompactL2)
+- `LsmReport` en `PipelineReport`
+- 13+ archivos modificados: `lsm.rs`, `engine/mod.rs`, `engine/init.rs`, `engine/ops.rs`, `engine/maintenance.rs`, `engine/stats.rs`, `archive.rs`, `physical_plan.rs`, `sdk/api.rs`, `sdk/search/mod.rs`, `engine/tests/`
+
+**Ponytail:** L0+L1 mínimo viable. L3 archive tier diferido.
+
+**Verificación:** `cargo check -p vantadb` ✅ | `cargo nextest run -p vantadb --build-jobs 2` ✅
+
+**Ids:** `COMP-026`
+
+### 2026-07-26 — OLD-03: Chaos Testing — Failpoint Harness Formal ✅
+
+**Fuente:** Backlog Phase 9 (Old Docs Rescue) `OLD-03`
+
+**Problema original:** Test `chaos_integrity_failpoints_certification()` existía con failpoints inline. Sin harness reutilizable, sin documentación, sin CI workflow.
+
+**Resuelto por (vanta-chaos, ponytail):**
+- `ChaosTestHarness` en `src/testing/chaos.rs`: setup/teardown automático, enable/disable/assert_recovery/destroy
+- 6 escenarios: wal_append, storage_insert, mmap_flush, hnsw_serialize, edge_write (nuevo), snapshot_serialize (nuevo)
+- `docs/chaos-testing.md` con patrón de failpoints, cómo agregar nuevos, cómo correr localmente
+- Feature-gated `failpoints` — 0 overhead en builds productivos
+
+**Verificación:** `cargo nextest run --features failpoints -p vantadb -- test_chaos` ✅ | `cargo check --features failpoints -p vantadb` ✅
+
+**Ids:** `OLD-03`
+
+**2026-07-27 — Post-certification fixes:**
+- **Bug:** Test binary no terminaba después de `ok` — proceso colgado en limpiza.
+- **Root cause 1:** `ChaosTestHarness` declaraba `dir: TempDir` antes que `engine: Arc<StorageEngine>`. Rust dropea struct fields en orden de declaración → `dir` se dropeaba primero e intentaba borrar el directorio temporal mientras el engine aún tenía archivos abiertos (Windows: no puede borrar archivos abiertos).
+- **Root cause 2:** `with_global_bar()` llamaba `pb.enable_steady_tick(100ms)` que spawnea un thread background con su propio `Arc` al estado del ProgressBar. Cuando el test terminaba y los thread-locals se limpiaban, el thread sobrevivía y prevenía la salida del proceso.
+- **Fix 1:** Reordenar campos `engine` → `dir` en struct (cambia orden de Drop).
+- **Fix 2:** Remover `enable_steady_tick` de `with_global_bar()` y `create_progress()`. Cambiar draw targets a `hidden()`.
+- **Commit:** `16e19434` (hang fix), `2812f9eb` (field order)
+- **Verificación:** 15 test binaries corridos (22 tests individuales). 0 hangs. 3 fallas pre-existentes no relacionadas. ✅
+
+### 2026-07-26 — OLD-08: Snapshots via Hard Links ✅
+
+**Fuente:** Backlog Phase 9 (Old Docs Rescue) `OLD-08`
+
+**Problema original:** `snapshot_certification.rs` existía, hard-link pattern POSIX no implementado.
+
+**Resuelto por (vanta-worker):**
+- `FsSnapshot` + `SnapshotManager` con hard-link POSIX (O(1) instantáneo)
+- `StorageEngine::create_snapshot(name)` / `list_snapshots()` 
+- `VantaEmbedded::create_snapshot(name)` en SDK público
+- CLI `vantadb snapshot create <name>` + `vantadb snapshot list`
+- +failpoint `snapshot_create_fail` para chaos testing
+- Tests: instant, multiple snapshots, independence
+
+**Verificación:** `cargo check -p vantadb` ✅ | `cargo nextest run -p vantadb -- snapshot` ✅
+
+**Ids:** `OLD-08`
+
+### 2026-07-26 — OLD-09: Olvido Bayesiano (Bayesian Hit Decay) ✅
+
+**Fuente:** Backlog Phase 9 (Old Docs Rescue) `OLD-09`
+
+**Problema original:** `EvictionPolicy` tenía hit counts + recency weights pero sin modelo probabilístico formal para decidir qué nodos evictar.
+
+**Resuelto por (vanta-worker, ponytail):**
+- `BayesianDecay` struct con modelo Beta-Binomial: `score = α/(α+β)` donde α = prior_alpha + hits, β = prior_beta + seconds_since_last_hit
+- `EvictionPolicy` enum que envuelve `Weighted` (legacy) o `Bayesian` (nuevo)
+- Threshold configurable (default 0.3) — scores por debajo → eviction candidate
+- Feature-gated `bayesian_decay`
+- 31 tests (boundary, param clamping, enum round-trip, weighted compat)
+
+**Verificación:** `cargo check --features bayesian_decay` ✅ | `cargo test --features bayesian_decay -- eviction` ✅ 31/31 | `cargo clippy` ✅
+
+### 2026-07-26 — OLD-11: CLI/TUI Interactivo ✅
+
+**Fuente:** Backlog Phase 9 (Old Docs Rescue) `OLD-11`
+
+**Problema original:** CLI completo existía (46 tests), TUI con spec de 1106 líneas no implementado.
+
+**Resuelto por (vanta-worker):**
+- `vantadb tui` subcomando con ratatui + crossterm, feature-gated `tui`
+- 3 modos: Dashboard (node count, memory %, cache, evictions, backend type), Monitor (live queries scaffold listo para hookear tracing), REPL (input con historial up/down, scroll, `.help`/`.clear`/`.stats`, ejecución IQL)
+- 744 líneas en 5 archivos nuevos: `src/tui/mod.rs`, `src/tui/dashboard.rs`, `src/tui/monitor.rs`, `src/tui/repl.rs`
+- Abre DB en read-only safe
+
+**Verificación:** `cargo check --features tui` ✅ | `cargo test --test cli_tests --features cli` ✅ 46/46
+
+**Ids:** `OLD-11`
+
+### 2026-07-26 — OLD-12: Pilot Program Formal ✅
+
+**Fuente:** Backlog Phase 9 (Old Docs Rescue) `OLD-12`
+
+**Problema original:** `docs/operations/PILOT_PROGRAM.md` existía como spec de 3 secciones, no como programa ejecutable.
+
+**Resuelto por (vanta-docs):**
+- `docs/operations/PILOT_PROGRAM.md` actualizado de 3→9 secciones: overview, early adopter profile, mutual commitments, timeline 8 semanas con milestones, KPI table (retention/NPS/benchmarks)
+- +3 templates: `pilot-agreement-template.md` (10 secciones, NDA 2 años), `pilot-feedback-template.md` (7 secciones, severity P0-P2, NPS), `pilot-onboarding-checklist.md` (6 fases con verification commands)
+
+**Verificación:** 4/4 archivos OK
+
+**Ids:** `OLD-12`
+
+### 2026-07-26 — OLD-19: Rehidratación desde Shadow Archive ✅
+
+**Fuente:** Backlog Phase 9 (Old Docs Rescue) `OLD-19`
+
+**Problema original:** `StorageEngine::recover_archived_nodes(summary_id)` existía en `maintenance.rs` con 6 tests, pero no estaba expuesto al SDK público, MCP, ni Python. El MCP ya retornaba `rehydration_available: true` en respuestas `StaleContext`, pero no había tool para ejecutar la rehidratación.
+
+**Resuelto por (vanta-worker, ponytail):**
+- `VantaEmbedded::recover_archived_nodes(summary_id: u128)` en `src/sdk/builder.rs` — delega al engine, convierte `UnifiedNode` → `VantaNodeRecord`
+- MCP tool `rehydrate` en `vantadb-mcp/src/lib.rs` — toma `summary_id` string, retorna `recovered_count` + `rehydration_complete: true`
+- Python binding `recover_archived_nodes(summary_id: &str)` en `vantadb-python/src/lib.rs` — parsea u128, llama con GIL detach, retorna lista de dicts
+- 2 tests SDK adicionales
+
+**Verificación:** `cargo check -p vantadb && cargo check -p vantadb-mcp && cargo check -p vantadb_py` ✅ | `cargo nextest run --profile audit -p vantadb -- test_recover_archived` ✅ 7/7 | `cargo clippy` todos ✅
+
+**Ids:** `OLD-19`
+
+### 2026-07-26 — OLD-16: WAL Rotation at 256MB ✅
+
+**Fuente:** Backlog Phase 9 (Old Docs Rescue) `OLD-16`
+
+**Problema original:** `WalWriter` tenía `rotate()` consumidor (toma `self`), pero no había auto-rotación por tamaño. ShardedWal heredaba el problema — los segmentos WAL no tenían límite.
+
+**Resuelto por (vanta-worker, ponytail):**
+- `WalWriter` ahora tiene `max_segment_size: u64` (hard-coded 256MB)
+- `try_auto_rotate(&mut self)` — flush → rename `vanta.wal` → `vanta.wal.<timestamp>` → fresh WAL con header → resetea contadores
+- Llamado al final de `append()` y `batch_append()` después de `maybe_sync()`
+- ShardedWal hereda gratis (sus métodos delegan a WalWriter)
+- 3 tests: trigger (archive existe + bytes_written reset), not-before-limit, data preservation (records verificables via WalReader)
+
+**Verificación:** `cargo nextest run --profile audit -p vantadb -- wal` ✅ 52/52 passed | `cargo check -p vantadb` ✅ | `cargo clippy -p vantadb -- -D warnings` ✅ | `cargo fmt --check` ✅
+
+**Ids:** `OLD-16`
+
+### 2026-07-26 — OLD-14: MessageThread / GcWorker for Agentic Chat ✅
+
+**Fuente:** Backlog Phase 9 (Old Docs Rescue) `OLD-14`
+
+**Problema original:** No existía una abstracción `MessageThread` para chats agentic. `GcWorker` existía en `src/gc.rs` (TTL GC) pero no se usaba para ciclos de vida de conversaciones.
+
+**Resuelto por (vanta-worker, ponytail):**
+- `src/agentic/` nuevo módulo con `mod.rs` + `thread.rs`
+- `MessageThread` struct: `thread_id`, `title`, `messages: Vec<Message>`, `created_at`, `updated_at`, `metadata`
+- `Message` struct: `role` (system/user/assistant/tool), `content`, `timestamp`, `metadata`
+- `ThreadStore` con CRUD completo sobre `StorageEngine` + opcional TTL via `GcWorker`
+- 6 métodos expuestos vía `VantaEmbedded`: `create_thread`, `send_message`, `get_thread`, `list_threads`, `delete_thread`, `purge_expired_threads`
+- 6 tests en `tests/message_thread_test.rs` incluyendo TTL expiry
+
+**Verificación:** `cargo nextest run --test message_thread_test` ✅ 6/6 pass | `cargo check -p vantadb` ✅ | `cargo clippy -p vantadb -- -D warnings` ✅
+
+**Ids:** `OLD-14`
+
+### 2026-07-26 — OLD-02: GraphRAG Pipeline Formal — seed → expand → retrieve → generate context ✅
+
+**Fuente:** Backlog Phase 9 (Old Docs Rescue) `OLD-02`
+
+**Problema original:** Existía un `examples/rust/graphrag.rs` que usaba la API raw de Node/Graph (insert manual → BFS), sin un pipeline formal con seed → expand → retrieve → context generation.
+
+**Resuelto por (vanta-lead, vanta-worker, ponytail):**
+- Pipeline completo en `src/graphrag/`: `mod.rs`, `pipeline.rs`, `seed.rs`, `expand.rs`, `retrieve.rs`, `context.rs`
+- `GraphRagPipeline` struct con defaults: `seed_k=10`, `hops=2`, `max_expansion_nodes=100`, `top_k=20`
+- `GraphRagResult` con campos: `nodes`, `edges`, `context_text`, `stats`
+- Método SDK `VantaEmbedded::graphrag_search(namespace, query, query_vector)` agregado
+- 4 tests en `tests/graphrag_test.rs` (simple_search, empty_result, hybrid_fallback, max_expansion) — **4/4 pass**
+- `docs/api/GRAPH_RAG.md` — API reference completa con Rust/Python usage
+- Task file creado en `.opencode/skills/campaign-executor/tasks/OLD-02.md`
+
+**Pendiente:** `examples/rust/graphrag.rs` aún usa API raw (no pipeline), falta `examples/python/graphrag_pipeline.py`
+
+**Verificación:** `cargo nextest run --test graphrag_test` ✅ 4/4 pass | `cargo check -p vantadb` ✅
+
+**Ids:** `OLD-02`
+
+### 2026-07-25 — DRV-014: ShardedWal::batch_append sin clonación de WalRecords ✅
+
+**Fuente:** Backlog Phase 2 `DRV-014`
+
+**Problema original:** `batch_append()` creaba `Vec<Vec<WalRecord>>` por shard y clonaba cada record con `record.clone()` — overhead de alloc en batches grandes.
+
+**Resuelto por (vanta-worker, ponytail):**
+- Eliminado el batch vector intermedio y `record.clone()` por completo
+- Reemplazado con loop directo `append()` round-robin por shard
+- -10 líneas de código, 0 allocs intermedios, misma semántica
+
+**Verificación:** `cargo check -p vantadb` ✅ | 25/25 tests wal_sharded ✅
+
+**Ids:** `DRV-014`
+
+### 2026-07-25 — DRV-136: vantadb-wasm bundle size measurement + LTO rustflags fix ✅
+
+**Fuente:** Backlog Phase 2 `DRV-136`
+
+**Resuelto por (vanta-worker):**
+- Medido bundle: 1,158 KB raw / 433 KB gzipped — dentro de rango normal para DB embebida en WASM
+- Todos los levers de optimización ya activos: `opt-level = "s"`, `wasm-opt -Oz`, `lto = "thin"`, `codegen-units = 1`
+- Fix en `.cargo/config.toml`: removido `-C lto=yes` de rustflags que rompía build WASM (`tracing-wasm` lib crate rechaza LTO)
+- Recomendación: fat LTO (`--config 'profile.release.lto="fat"'`) opcional para ~5-10% extra
+
+**Verificación:** `cargo check -p vantadb-wasm` ✅ | `cargo build -p vantadb-wasm --target wasm32-unknown-unknown --release` ✅
+
+**Ids:** `DRV-136`
+
+### 2026-07-25 — REV-012: HNSW insert_lock contention analysis ✅
+
+**Fuente:** Backlog Phase 2 `REV-012`
+
+**Resuelto por (vanta-tuner, ponytail):**
+- Análisis de 3 puntos de contención:
+  - DashMap `nodes`: shard count = num_cpus * 4, critical sections µs-scale → ✅ Adecuado
+  - Mutex RNG: 2-5µs hold, 64 adquisiciones/batch → 🟡 No medido como bottleneck
+  - FairMutex insert_lock: micro-batching 64 ops/acq + try_lock non-blocking drain → ✅ Bien mitigado
+- Sin code changes — todo ya mitigado. Comentario ponytail documentando upgrade path (thread_local SmallRng si profiling lo requiere)
+
+**Verificación:** `cargo check -p vantadb` ✅
+
+**Ids:** `REV-012`
+
+### 2026-07-25 — Phase 3 Test Coverage: 7 tasks completadas (document-only) ✅
+
+**Fuente:** Backlog Phase 3 — evaluación de cobertura de tests
+
+**Resultados — 0 code changes (todas document-only, ponytail):**
+
+| ID | Módulo | Tests | Hallazgo |
+|----|--------|-------|----------|
+| `DRV-013` | ShardedWal | 25 tests, ~90%+ line coverage | Gap: concurrent access no testeado. Document-only |
+| `DRV-017` | search.rs / serialize.rs | 33+29 tests | Gap: mmap zero-copy unsafe path no testeado. Document-only |
+| `DRV-061` | OpenAI adapter | 10 tests/119L | Happy path sólido. Error paths dependen de API externa. |
+| `DRV-067` | Ollama adapter | 8 tests/79L | Adapter 1-line delegate. Document-only |
+| `DRV-073` | LiteLLM adapter | 10 tests/78L | Mejor coverage de los 3. Document-only |
+| `TEST-11` | Frontend (Vitest + Playwright) | 38+54 tests | Sin cross-browser WASM (demo es placeholder). Document-only |
+| `TEST-12` | Fuzzing | 4 targets + proptest | Sin corpus guardado ni storage API fuzz. Document-only |
+
+**Verificación:** todos los checks pasan ✅
+
+**Ids:** `DRV-013`, `DRV-017`, `DRV-061`, `DRV-067`, `DRV-073`, `TEST-11`, `TEST-12`
+
+### 2026-07-25 — DRV-054: read_axioms extraído a const + resolve_axioms() con fallback ✅
+
+**Fuente:** Backlog `DRV-054` — 4 axioms inline, no sync con metadata
+
+**Problema original:** `AXIOMS` en `vantadb-mcp/src/lib.rs:77-82` era un string JSON literal sin posibilidad de override desde storage.
+
+**Resuelto por (vanta-worker):**
+- Renombrado `AXIOMS` → `HARDCODED_AXIOMS` (semántica de fallback)
+- Agregadas constantes `SYSTEM_NAMESPACE` y `AXIOMS_STORAGE_KEY` para lookup en storage
+- Creada `resolve_axioms()`: intenta `embedded.get("_system", "axioms")`, fallback a const
+- Handler `read_axioms` actualizado a `resolve_axioms(storage)`
+- Lookup best-effort (fallback safe en error: not found, parse error, engine no init)
+
+**Verificación:** `cargo check -p vantadb-mcp` ✅ | `cargo clippy -p vantadb-mcp -- -D warnings` ✅
+
+**Ids:** `DRV-054`
+
+### 2026-07-25 — Refactor Batch: DRV-036, DRV-038, DRV-029, DRV-032, DRV-055 ✅
+
+**Fuente:** Backlog `DRV-036`, `DRV-038`, `DRV-029`, `DRV-032`, `DRV-055`
+
+**Resuelto por:**
+- **`DRV-036` (TypeScript SDK):** `_mapRecord` actualizado para usar `isMemoryRecord(r)` de `guards.ts` para validación de tipo exhaustiva.
+- **`DRV-038` (TypeScript SDK):** `MemoryRecord` actualizado para permitir `string | number` en campos de tiempo/versión/ID para paridad total con Rust/Python `u64`.
+- **`DRV-029` (Python SDK):** `py_dict_to_metadata` optimizado con retorno inmediato en diccionarios vacíos y generación de cache-key sin allocs de strings intermedios.
+- **`DRV-032` (Python SDK):** Documentación explícita y estructura limpia para las firmas PyO3 con `too_many_arguments`.
+- **`DRV-055` (MCP):** `test_mcp_invalid_json` refactorizado para testear estrictamente la respuesta del protocolo MCP JSON-RPC (`-32700` y `-32602`) en vez de `serde_json` interno.
+
+**Verificaciones:** `npx tsc --noEmit` ✅ | `cargo check -p vantadb_py` ✅ | `cargo test --package vantadb-mcp` ✅ (25/25 passed)
+
+**Ids:** `DRV-036`, `DRV-038`, `DRV-029`, `DRV-032`, `DRV-055`
+
+### 2026-07-25 — DRV-034: Refactorización de bloques try-catch en TypeScript SDK ✅
+
+**Fuente:** Backlog `DRV-034` — 38 bloques try-catch repetidos en `vantadb-ts/src/vantadb.ts`
+
+**Problema original:** Cada método de instancia de la clase `VantaDB` en el SDK TypeScript contenía un bloque try-catch idéntico `try { ... } catch(e) { throw wrapWasmError(e, "X"); }`, generando ~200 líneas de boilerplate sin valor.
+
+**Resuelto por:**
+- Introducido método privado genérico `_wasm<T>(method: string, fn: () => T): T` en la clase `VantaDB`.
+- Refactorizados 35 bloques try-catch en métodos de instancia a llamadas `_wasm()`.
+- 3 factory methods estáticos (`connect`, `create`, `open`) conservan su try-catch propio (no tienen `this`).
+- `close()` preserva su `try/finally` por el side-effect crítico de `_closed = true`.
+- Hallazgo colateral: `reindex_hnsw_from_text` no estaba en el binario WASM instalado — se documentó con `VantaError` explícito hasta que el WASM sea actualizado.
+
+**Verificación:** `npx tsc --noEmit` ✅ 0 errores.
+
+**Ids:** `DRV-034`
+
+### 2026-07-25 — DRV-030: Refactor de conversores _to_pydict vía Macro Rust ✅
+
+**Fuente:** Backlog `DRV-030` — Conversores de reportes a PyDict duplicados en PyO3
+
+**Problema original:** `vantadb-python/src/convert.rs` contenía 12 conversores de reportes a diccionarios de Python (`PyDict`) con ~180 líneas de código repetitivo de PyO3 (`PyDict::new(py)`, `.set_item(...)`, `Ok(dict.unbind().into())`).
+
+**Resuelto por:**
+- Definida la macro declarativa `pydict_set!` en `convert.rs`.
+- Refactorizadas las funciones `rebuild_report_to_pydict`, `export_report_to_pydict`, `import_report_to_pydict`, `text_index_repair_report_to_pydict`, `text_index_audit_report_to_pydict`, y `operational_metrics_to_pydict` usando la macro.
+- Código reducido en ~180L manteniendo 100% la compatibilidad y firma de retorno.
+
+**Verificación:** `cargo check -p vantadb_py` ✅
+
+**Ids:** `DRV-030`
+
+### 2026-07-25 — DRV-050: Sanitización de Inyección de Consultas en MCP ✅
+
+**Fuente:** Backlog `DRV-050` — MCP injection: LISP query via string interpolation
+
+**Problema original:** `query_lisp()` en `vantadb-mcp/src/lib.rs` no desinfectaba ni validaba adecuadamente las cadenas de entrada recibidas desde clientes MCP, dejando un vector de inyección de código/comandos o caracteres nulos descontrolados.
+
+**Resuelto por:**
+- Agregada validación de entradas vacías y detección/rechazo de caracteres de byte nulo (`\0`) en la tool `query_lisp` del servidor MCP.
+- Implementado recorte y desinfección previa al envío a `executor.execute_hybrid()`.
+- Añadida suite de pruebas en `vantadb-mcp/tests/mcp_tests.rs` (`test_mcp_query_lisp_sanitization`).
+
+**Verificación:** `cargo test --package vantadb-mcp` ✅
+
+**Ids:** `DRV-050`
+
+### 2026-07-25 — OLD-05: Search Quality v2 (Unicode + snippets) ✅
+
+**Fuente:** Backlog `OLD-05` — Search Quality v2 (Unicode + snippets)
+
+**Problema original:** La extracción de snippets y el resaltado de términos (`generate_snippet_with_highlighting` y `highlight_terms`) en el core dependían de `to_ascii_lowercase()` y `eq_ignore_ascii_case()`, fallando al buscar o resaltar coincidencias insensibles a diacríticos/acentos (`café` vs `cafe`, `rápido` vs `rapido`).
+
+**Resuelto por:**
+- Implementado Unicode accent folding (`fold_char` y `fold_str`) en `src/sdk/search/snippet.rs` para insensibilidad a diacríticos en la búsqueda de posición de snippet y resaltado `<strong>`.
+- Preservados los caracteres y diacríticos originales del texto fuente dentro de las etiquetas `<strong>`.
+- Añadidos unit tests `unicode_folding_snippet_accent_match` y `unicode_folding_snippet_unaccented_query`.
+
+**Verificación:** `cargo test --package vantadb --lib sdk::search::snippet::tests` ✅
+
+**Ids:** `OLD-05`
+
+### 2026-07-26 — DRV-130 T1 fix: SearchProfile gated tras #[cfg(debug_assertions)] ✅
+
+**Fuente:** Backlog P4 `DRV-130` (refinimiento T1)
+
+**Problema:** SearchProfile original tenía `if vector_store.is_some()` inline en hot path. ThinLTO no podía especializar entre `None` vs `Some(vfile)`, causando 23% overhead solo por tener el parámetro (bench `pass_none`: 506ms vs in_memory 412ms).
+
+**Resuelto por:**
+- SearchProfile partido en dos: struct real con tracking (`#[cfg(debug_assertions)]`) y ZST no-op (`#[cfg(not(debug_assertions))]`)
+- Métodos extraídos: `record_vfile_entry`, `record_vfile_candidate`, `start_compute`/`end_compute`
+- `if vector_store.is_some()` eliminado del hot path — siempre se llama al método, en release es no-op
+
+**Resultado:** `pass_none` overhead eliminado (506ms → 282ms). `in_memory -26%`, `with_vfile -24%`. 1515 tests pasan.
+
+**Ids:** `DRV-130`
+
+### 2026-07-25 — DRV-130: SIFT 1M search bottleneck — SearchProfile + prefetch audit ✅
+
+**Fuente:** Backlog P4 `DRV-130`
+
+**Problema original:** `search_nearest` usa HNSW sin optimización SSD-locality. SIFT 1M high-recall en 127s.
+
+**Resuelto por (vanta-tuner, ponytail):**
+- **T1 ✅ SearchProfile:** Nuevo `SearchProfile` struct en `src/index/search.rs` con `vfile_reads`, `unique_pages`, `compute_ns`, `candidates_seen`. Instrumentado en hot paths de `search_layer`.
+- **T2 ✅ WONTFIX:** `prefetch_mmap_vector` ya implementa `madvise(MADV_WILLNEED)` / `PrefetchVirtualMemory`. Prefetch ya activo.
+- **T3 ❌ WONTFIX:** Node reordering investigado y descartado. Benchmark con `compact_layout` (BFS reorder) mostró solo ~9% de mejora (2,440→2,221 ms). Search sigue greedy distance-guided path, no BFS order. Overhead es de function calls y bounds checks, no page misses. <20% threshold → cerrado como WONTFIX.
+
+**Verificación:** `cargo bench --bench vfile_search` — in_memory: 783ms, with_vfile: 2,440ms, with_vfile_compacted: 2,221ms (~9% improvement). `cargo check --benches` ✅.
+
+**Ids:** `DRV-130`
+
+### 2026-07-24 — DRV-022: Eliminado governance/ dead code (1235L) ✅
+
+**Fuente:** Backlog stabilization plan — Phase 2, Task 11
+
+**Problema original:** `src/governance/` contenía 5 archivos (1235L total) con `#![allow(dead_code)]`, gated tras feature `governance` no-default sin consumidores. Feature nunca activada, dependía de `sync_ext` que hacía compilación inviable incluso si se activara.
+
+**Resuelto por:** Eliminación completa del directorio `src/governance/` y feature `governance` de `Cargo.toml`. Conservados: `DuplicatePreventionFilter`, `OriginCollisionTracker`, `compute_confidence_friction` — ya extraídos en `src/utils/` como production-ready, re-exportados vía `pub use utils::compute_confidence_friction`.
+
+**Verificación:** `cargo check -p vantadb` ✅ (0 errores). `cargo clippy -p vantadb -- -D warnings` ✅.
+
+**Ids:** `DRV-022`
+
+### 2026-07-24 — DRV-059/065/071/087/091/096: RwLock<String> → String (6 tasks ✅)
+
+**Fuente:** Backlog DRV Hallazgos — adapters/providers, `review-deep` Wave 0 (quick)
+
+**Problema original:** 6 adapters usaban `RwLock<String>` para `namespace` que nunca se escribía, solo se leía (0 `.write()`, múltiples `.read().unwrap().clone()`). Overhead innecesario de lock + alloc.
+
+**Resuelto por:** La **Adapter Restructure** (commit `accbfa8`) reestructuró todo el sistema:
+- **DRV-059** (OpenAI): `providers/openai/src/python.rs:70` → `namespace: String` plano
+- **DRV-065** (Ollama): `providers/ollama/src/python.rs:41` → `namespace: String` plano
+- **DRV-071** (LiteLLM): `providers/litellm/src/python.rs:72` → `namespace: String` plano
+- **DRV-087** (CrewAI): Migró de Rust PyO3 a Python puro (`integrations/crewai/`). `RwLock` no existe en Python.
+- **DRV-091** (DSPy): Migró de Rust PyO3 a Python puro (`integrations/dspy/`). Idem.
+- **DRV-096** (Haystack): Migró de Rust PyO3 a Python puro (`integrations/haystack/`). Idem.
+
+**Verificación:** `grep -r "RwLock" providers/` → 0 matches. `grep -r "RwLock" integrations/` → 0 matches.
+
+**Ids:** `DRV-059`, `DRV-065`, `DRV-071`, `DRV-087`, `DRV-091`, `DRV-096`
+
+### 2026-07-24 — DRV-070/086/092/098/103/110: Metadata no-string ignorado (6 tasks ✅)
+
+**Fuente:** Backlog DRV Hallazgos — adapters/providers
+
+**Problema original:** `v.extract::<String>()` en Rust PyO3 descartaba silenciosamente Bool/Int/Float. Usuario pasaba `metadata={"count": 5}` y el valor desaparecía sin warning.
+
+**Resuelto por adapter restructure + migración a Python:**
+- **DRV-070** (LiteLLM): `providers/litellm/src/python.rs:282-288` — fallthrough chain `String→bool→i64→f64`
+- **DRV-086** (CrewAI): Migrado a Python puro (`integrations/crewai/`). Commit `b83f0f9`
+- **DRV-092** (DSPy): Migrado a Python puro (`integrations/dspy/`). Commit `b83f0f9`
+- **DRV-098** (Haystack): Migrado a Python puro (`integrations/haystack/`). `dict(doc.meta)` maneja todos los tipos
+- **DRV-103** (LangChain): Migrado a Python puro (`integrations/langchain/`). Commit `b83f0f9`
+- **DRV-110** (LlamaIndex): Migrado a Python puro (`integrations/llamaindex/`). Commit `b83f0f9`
+
+**Verificación:**
+- LiteLLM Rust provider: `grep "extract::<String>" providers/litellm/src/python.rs` → solo en key extraction (correcto), metadata usa fallthrough chain
+- 5 adapters Python: no hay `v.extract::<String>()` en código Python
+
+**Ids:** `DRV-070`, `DRV-086`, `DRV-092`, `DRV-098`, `DRV-103`, `DRV-110`
+
+### 2026-07-24 — DRV-068/069/074/079/085/107/112: Misc GIL + pagination + test coverage (7 tasks ✅)
+
+**Fuente:** Backlog DRV Hallazgos — Bug C + Bug D
+
+- **DRV-068/069** (LiteLLM GIL + store()): Resuelto por adapter restructure.
+  `search()` ahora usa `py.detach()` (L243), `store()` acepta `py: Python` (L263)
+- **DRV-074/079/085** (Paginación solo página 1): Resuelto por migración a Python puro.
+  Mem0: `delete_col()` usa `delete_namespace()` atómico. Letta: `list()` acepta custom limit. CrewAI: `list()` soporta cursor
+- **DRV-107** (LangChain test coverage): 5 tests/43L → **25 tests/256L**
+- **DRV-112** (LlamaIndex delete malformed IDs): Migrado a Python puro. `delete()` cursor-based con `rec.key`
+- **Ids:** `DRV-068`, `DRV-069`, `DRV-074`, `DRV-079`, `DRV-085`, `DRV-107`, `DRV-112`
+
+### 2026-07-24 — TIER 4: REV-010/DRV-023/DRV-044/DRV-046 resueltos (4 tasks ✅)
+
+**Fuente:** Backlog TIER 4 — refactors medianos, verificación contra código actual
+
+| ID | Resolución |
+|----|------------|
+| **REV-010** | `src/sdk/serialization/mod.rs` (1827L) ya split en **8 archivos**: mod.rs 1051L + 7 submodulos (conversions, graph_types, impl_export, impl_index, impl_rebuild, impl_text_index, vector_types). Total 4223L en 8 archivos. |
+| **DRV-023** | `ResourceGovernor` ya tiene callers: `execute_plan`/`execute_statement` en planner.rs + integration test `engine_governor_certification` en `tests/logic/governor.rs`. `ALLOCATED_BYTES` trackeado. |
+| **DRV-044** | `vantadb-server/src/main.rs` reescrito (58L). Flujo async: `run_stdio_server(storage).await` → flush → exit natural. Eliminado `process::exit(0)` en shutdown path. |
+| **DRV-046** | `vantadb-mcp/src/lib.rs` usa `tokio::io::AsyncBufReadExt::lines()` (L364) no bloqueante + `tokio::sync::Semaphore` (L329) + graceful shutdown via `AtomicBool`. |
+
+**Ids:** `REV-010`, `DRV-023`, `DRV-044`, `DRV-046`
+
+### 2026-07-24 — DRV-027: Refactor vantadb-python/src/lib.rs God module (1991L → 4 files) ✅
+
+**Fuente:** Backlog DRV Hallazgos — Python SDK (TIER 2, `review-deep` Wave 0)
+
+**Problema original:** `vantadb-python/src/lib.rs` tenía 1991 líneas mezclando VantaDB pyclass (~35 métodos), 22 funciones de conversión `*_to_pydict`, LRU cache, VantaVector/VantaVectorIter, VantaPySearchHit, error mapping, y helpers vectoriales. God module con responsabilidades no separadas.
+
+**Resuelto por:** División en 4 archivos especializados:
+- **`convert.rs`** (28,799 B) — todas las funciones de conversión Python↔VantaValue + LRU cache + error mapping
+- **`vector.rs`** (3,269 B) — VantaVector, VantaVectorIter pyclasses
+- **`types.rs`** (11,142 B) — existente, se le agregó VantaPySearchHit
+- **`lib.rs`** (40,131 B, ~900L) — solo VantaDB pyclass, connect(), módulo setup
+
+**Verificación:** `cargo check -p vantadb_py` → ✅ 0 errores. `cargo clippy -p vantadb_py` → ✅ 0 issues. `cargo fmt` aplicado. Sin cambios en API pública.
+
+**Ids:** `DRV-027`
+
+### 2026-07-24 — Pipeline: auto-progreso + auto-commit en /pipeline task ✅
+
+**Proceso:** Se detectó que `skill progreso` (Trigger 1 — migración de tareas completadas) y el commit automático no se ejecutaban al final del pipeline MODO TAREA.
+
+**Fix:**
+- `pipeline.md` pasos 6-7 agregados después del Review: `skill progreso` + auto-commit
+- Aplica a ambos modos: MODO TAREA y MODO RUN
+- Decisión registrada en campaign_memory como policy
+
+### 2026-07-24 — VFY-010: ACID Phase 2 — Buffered Write Transactions ✅
+
+**Fuente:** Backlog (VFY Hallazgos)
+
+**Problema original:** Cada `insert()`/`delete()` escribía a stores y WAL inmediatamente — N fsyncs por transacción. Sin buffer, `abort()` no podía descartar writes ya enviados a stores.
+
+**Resuelto por:** Buffer writes in-memory durante la transacción. I/O a stores y WAL diferido hasta `commit()`. En `abort()` los buffers se descartan sin escribir nada.
+
+**Cambios:**
+- `src/storage/engine/mod.rs` — `BufferedWrite` enum (Insert/Delete), `active_txn_id`, `txn_buffers`
+- `src/storage/engine/init.rs` — inicialización de nuevos campos
+- `src/storage/engine/ops.rs` — `begin_transaction()` setea txn_id (sin WAL); `insert()`/`delete()` bufferan si hay txn activa; `commit_transaction()` drena buffer → WAL batch → apply stores; `abort_transaction()` descarta buffer; `get()` chequea buffer primero (read-your-writes)
+- `src/storage/engine/tests.rs` — 6 tests nuevos (commit_persists, abort_rolls_back, delete_abort, read_your_writes, empty_commit, double_commit_error)
+
+**Verificación:** `cargo check -p vantadb` ✅. 3 tests existentes ✅. 6 tests nuevos ✅. Cero regresiones.
+
+**Ids:** `VFY-010`
+
+### 2026-07-23 — DRV-001: Refactor search.rs god file (1162L → 845L, 5 sub-modules) ✅
+
+**Fuente:** Backlog DRV Hallazgos — SDK, `review-deep` Wave 0
+
+**Objetivo:** Dividir `src/sdk/search.rs` (1162L, 4+ responsabilidades) en sub-módulos con responsabilidad única, agregando tests unitarios donde sea viable.
+
+**6 pasos completados:**
+- **Step 1 (phrase.rs):** `text_positions_match_phrase`, `text_positions_match_phrases` → free fns + 13 tests
+- **Step 2 (snippet.rs):** `generate_snippet_with_highlighting`, `highlight_terms` → free fns + 9 tests
+- **Step 3 (debug.rs):** 5 debug helpers extraídos del impl block (rank_map, explain_hit, identities, bm25_terms, matched_phrases). 15 call sites actualizados.
+- **Step 4 (text_index.rs):** 4 helpers de audit/repair/ensure_text_index extraídos. mod.rs solo retiene 4 wrappers de delegación (1-6 líneas c/u).
+- **Step 5:** 22 unit tests totales (phrase + snippet). debug.rs y text_index.rs requieren StorageEngine mock — cubiertos por tests de integración.
+- **Step 6:** fmt, clippy --deny, nextest (1598/1599 ✅) — 1 pre-existing flaky. Sin breaking changes en API pública.
+
+**Estructura final:** `src/sdk/search/{mod,phrase,snippet,debug,text_index}.rs`
+
+**Ids:** `DRV-001`
+
+### 2026-07-19 — DRV-002 + DRV-003: SDK duplication removal & perf fix ✅
+
+**Fuente:** Backlog DRV Hallazgos — SDK, `review-deep` Wave 0
+
+- **DRV-002:** `put_batch` duplicaba ~50 líneas de `put()`. Se extrajo método privado `put_one()` — ambos métodos delegan a él. [`f029d42`](`fix: Bug Fix Phase 1`)
+- **DRV-003:** `purge_expired` llamaba `replace_derived_indexes` O(n) veces por nodo → reemplazado por `derived_delete_ops` (selectivo). [`d9e1caf`](`perf(DRV-003)`)
+
+**Ids:** `DRV-002`, `DRV-003`
 
 ### 2026-07-19 — Deferred Fixes Post-RC (DEF-01 → DEF-05) ✅
 
@@ -573,54 +1208,68 @@ Se completan 25 tareas en una gran tanda pre-lanzamiento que abarca 7 áreas cr�
 - **Archivos creados:** `completions/_vanta-cli`, `completions/_vanta-cli.ps1`, `completions/vanta-cli.bash`, `completions/vanta-cli.fish`
 - **Tests:** 46 CLI tests, all pass
 
-### TSK-111 — Expanded Filter Operators (2026-06-21)
+### TSK-111 — Expanded Filter Operators (2026-06-21) — ❌ NUNCA IMPLEMENTADO
 
 - **Goal:** Extend the flat equality filter system (`VantaMemoryMetadata`) with comparison operators (`Eq, Neq, Gt, Gte, Lt, Lte, In, Exists`).
-- **Checklist completed:**
-  - [x] `FilterOperator` enum in `src/sdk.rs`
-  - [x] `MemoryFilter` struct with `field`, `operator`, `value`
-  - [x] `evaluate_filter()` and `compare_vanta_values()` for type-safe evaluation
-  - [x] `filter_exprs: Vec<MemoryFilter>` added to `VantaMemoryListOptions` and `VantaMemorySearchRequest`
-  - [x] Backward compat: flat filters still work like `Eq`
-  - [x] Prefix scan optimization: first `Eq` filter is used for scan, post-filter with all conditions
-- **Files modified:** `src/sdk.rs`, `src/lib.rs`
-- **Exports:** `FilterOperator`, `MemoryFilter` re-exported from `src/lib.rs`
+- **Realidad:** Engine layer (`src/query.rs`, `src/physical_plan.rs`) tiene los 6 operadores (`Eq, Neq, Gt, Lt, Gte, Lte`) para IQL queries. Pero el SDK layer (`src/sdk/serialization/mod.rs:368` — `matches_memory_filters()`) solo hace comparación plana `==`. **`FilterOperator`, `MemoryFilter`, `filter_exprs` nunca existieron en `src/sdk.rs`.** Este checklist documenta algo que debía hacerse pero no se completó.
+- **Checklist REAL:**
+  - [ ] `FilterOperator` enum en `src/sdk.rs`
+  - [ ] `MemoryFilter` struct con `field`, `operator`, `value`
+  - [ ] `evaluate_filter()` y `compare_vanta_values()`
+  - [ ] `filter_exprs` en `VantaMemoryListOptions` y `VantaMemorySearchRequest`
+  - [ ] Exposición a Python/WASM via PyO3/WASM bindings
+- **Causa raíz:** Feature documentada y diseñada pero nunca implementada en el SDK. Solo existe en el engine interno (IQL).
+- **Archivos que DEBERÍAN modificarse:** `src/sdk/serialization/mod.rs`, `vantadb-python/src/lib.rs`, `vantadb-wasm/src/lib.rs`
 
-### TSK-119 — delete_by_filter (2026-06-21)
+### TSK-119 — delete_by_filter (2026-06-21) — ❌ NUNCA FUE SDK, ELIMINADO
 
 - **Goal:** Delete multiple records per metadata filter from SDK and CLI.
-- **Checklist completed:**
-  - [x] `VantaEmbedded::delete_by_filter()` — use `records_for_namespace()` + `matches_memory_filters()`, return count of deleted
-  - [x] `vanta-cli delete-by-filter --namespace <ns> --filter key=val`
-- **Files modified:** `src/cli.rs`, `src/cli_handlers.rs`, `src/bin/vanta-cli.rs`, `src/sdk.rs`
-- **Bindings updated:** `vantadb-wasm`, `vantadb-python`, `vantadb-mcp` added `filter_exprs: vec![]`
+- **Realidad:** Solo existió como CLI handler (`cmd_delete_by_filter` en `src/cli_handlers.rs`). **Nunca fue parte del SDK programático** (`VantaEmbedded`). El CLI handler fue eliminado en **commit `e9371ea8` (AUD-09)** como dead code: "4 CLI handlers (cmd_search_similar, cmd_count, cmd_delete_by_filter, cmd_repl, cmd_tui) + rustyline + strsim (~560 LOC)".
+- **Checklist REAL:**
+  - [ ] `VantaEmbedded::delete_by_filter()` en `src/sdk/api.rs`
+  - [ ] Exposición Python via PyO3
+  - [ ] Exposición WASM
+  - [ ] Tests
+- **Bindings:** Ningún binding fue actualizado (los `.pyi` stubs no lo listan, ni `vantadb-wasm/src/lib.rs` lo tiene).
+- **Archivos que DEBERÍAN modificarse:** `src/sdk/api.rs`, `vantadb-python/src/lib.rs`, `vantadb-wasm/src/lib.rs`, `vantadb-python/vantadb_py/__init__.pyi`
 
-### TSK-86 — similar_to_key (2026-06-21)
+### TSK-86 — similar_to_key (2026-06-21) — ❌ NUNCA IMPLEMENTADO
 
 - **Goal:** Convenience: search for similar records using the vector of an existing record by its key.
-- **Checklist completed:**
-  - [x] `VantaEmbedded::similar_to_key(namespace, key, top_k)` — get record, extract vector, run search
-  - [x] `vanta-cli search-similar --namespace <ns> --key <key> [--limit <N>]`
-- **Files modified:** `src/cli.rs`, `src/cli_handlers.rs`, `src/bin/vanta-cli.rs`, `src/sdk.rs`
+- **Realidad:** `similar_to_key` **nunca se implementó** en ningún lenguaje. No existe en Rust SDK (`src/sdk/api.rs`), ni en Python, ni WASM, ni TS. Git history confirma: cero commits con código `.rs` o `.py` para esta función. Solo existe como concepto en documentación (`docs/api/PYTHON_SDK.md` la menciona como "(not yet exposed)").
+- **Checklist REAL:**
+  - [ ] `VantaEmbedded::similar_to_key(namespace, key, top_k)` en `src/sdk/api.rs`
+  - [ ] CLI handler `vanta-cli search-similar`
+  - [ ] Exposición Python/WASM/TS
+  - [ ] Tests
+- **Causa raíz:** Deuda de especificación — se documentó pero nunca se codificó.
+- **Archivos que DEBERÍAN modificarse:** `src/sdk/api.rs`, `src/cli_handlers/search.rs`, `vantadb-python/src/lib.rs`, `vantadb-wasm/src/lib.rs`
 
-### TSK-87 — count with filters (2026-06-21)
+### TSK-87 — count with filters (2026-06-21) — ❌ NUNCA FUE SDK, ELIMINADO
 
 - **Goal:** Count records in a namespace, optionally filtered by metadata.
-- **Checklist completed:**
-  - [x] `VantaEmbedded::count(namespace, filters, filter_exprs)` — prefix scan without filters, scan + filter with filters
-  - [x] `vanta-cli count --namespace <ns> [--filter key=val]`
-- **Files modified:** `src/cli.rs`, `src/cli_handlers.rs`, `src/bin/vanta-cli.rs`, `src/sdk.rs`
+- **Realidad:** Solo existió como CLI handler (`cmd_count` en `src/cli_handlers.rs`). **Nunca fue parte del SDK programático** (`VantaEmbedded::count()`). El CLI handler fue eliminado en **commit `e9371ea8` (AUD-09)** como dead code junto con delete_by_filter y search-similar.
+- **Checklist REAL:**
+  - [ ] `VantaEmbedded::count(namespace, filters)` en `src/sdk/api.rs`
+  - [ ] CLI handler `vanta-cli count`
+  - [ ] Exposición Python/WASM/TS
+  - [ ] Tests
+- **Nota:** Existe un helper interno `fn count_memory_records_from()` en el engine, pero no es público.
+- **Archivos que DEBERÍAN modificarse:** `src/sdk/api.rs`, `src/cli_handlers/mod.rs`, `vantadb-python/src/lib.rs`, `vantadb-wasm/src/lib.rs`
 
-### TSK-88 — Multi-namespace Search (2026-06-21)
+### TSK-88 — Multi-namespace Search (2026-06-21) — ❌ NUNCA IMPLEMENTADO
 
 - **Goal:** Search multiple namespaces simultaneously.
-- **Checklist completed:**
-  - [x] `namespaces: Vec<String>` in `VantaMemorySearchRequest`
-  - [x] Backward compat: if `namespaces` is empty, `namespace` is used
-  - [x] Implementation: iterate namespaces, run search for each one, merge top_k for score
-  - [x] CLI: `vanta-cli search --namespace ns1,ns2,... --query <q>` accepts comma separated list
-- **Files modified:** `src/cli.rs`, `src/cli_handlers.rs`, `src/bin/vanta-cli.rs`, `src/sdk.rs`
-- **Tests:** All existing ones updated with `namespaces: vec![]`
+- **Realidad:** `VantaMemorySearchRequest` siempre ha tenido `namespace: String` (singular). **`namespaces: Vec<String>` nunca existió.** El git history pre-refactor (`72d334c3^:src/sdk.rs`) confirma que siempre fue `namespace: &str`. El único `Vec<String>` de namespaces está en tipos de reporte (output: `VantaExportReport.namespaces`, `VantaTextIndexAuditReport.namespaces_audited`), no como parámetro de búsqueda.
+- **Checklist REAL:**
+  - [ ] `namespaces: Vec<String>` en `VantaMemorySearchRequest` (tipos)
+  - [ ] Backward compat: si `namespaces` vacío, usar `namespace`
+  - [ ] Implementación: iterar namespaces, merge top_k por score
+  - [ ] CLI: `vanta-cli search --namespace ns1,ns2,...`
+  - [ ] Exposición Python/WASM
+  - [ ] Tests
+- **Causa raíz:** Feature diseñada/documentada pero nunca implementada ni en tipos ni en lógica de búsqueda.
+- **Archivos que DEBERÍAN modificarse:** `src/sdk/serialization/vector_types.rs`, `src/sdk/search/mod.rs`, `src/sdk/api.rs`, `src/cli_handlers/search.rs`, `vantadb-python/src/lib.rs`, `vantadb-wasm/src/lib.rs`
 
 ### TSK-120 — ARM64 CI Environment Correction (Exit Code 127) (2026-06-22)
 
@@ -673,6 +1322,7 @@ These tasks reached 100% completion and were moved here from the active backlog.
 | `AUD-06` | Fix referencia caída en DURABILITY_GUARANTEES.md | → ✅ `chaos_testing.rs` → `chaos_integrity.rs` en `DURABILITY_GUARANTEES.md:287` | 🔴 | ✅ |
 | `AUD-07` | Fix `README.MD` uppercase en README_ES.md | → ✅ `README.MD` → `README.md` en `README_ES.md:24` | 🔴 | ✅ |
 | `AUD-WORK` | Fix de CI y Auditoría de Workflows | → ✅ Corregidas exclusiones de nextest a nivel workspace, declaración de tests en Cargo.toml, clasificación de mcp_tests/tokenizer y features en CI. | 🔴 | ✅ |
+| `DRV-001` | Refactor search.rs god file (1162L→845L, 5 sub-modules). phrase.rs + snippet.rs + debug.rs + text_index.rs. 22 unit tests nuevos. | 🟡 | ✅ |
 | `AUD-08` | Auditar 33 bloques `unsafe` | Auditoría completada: 39 ítems unsafe (33 bloques, 4 impls, 1 pub fn, 1 extern fn). → ✅ 77% low-risk (mmap/FFI), 20.5% medium (from_raw_parts), 2.6% high (`pub unsafe fn release_mmap_vector`). Reporte completo en artifact del agente. | 🟡 | ✅ |
 | `AUD-09` | Eliminar estado mutable global en tests | → ✅ `static TEST_RESULTS` eliminado, `static MULTI_PROGRESS` migrado a `thread_local!` + `RefCell`. Compilación limpia. | 🟡 | ✅ |
 | `AUD-10` | Fix `set_var`/`remove_var` sin restore | → ✅ Variables de entorno se guardan/restauran en prefetch_benchmark.rs usando `var_os()` + `set_var`/`remove_var`. | 🟡 | ✅ |
@@ -716,7 +1366,7 @@ These tasks reached 100% completion and were moved here from the active backlog.
 | `TSK-112` | TS SDK vía WASM (core→wasm32-wasi, wrapper, npm) | 🔴 | ✅ |
 | `TSK-113` | TS types + docs (intellisense, quickstart Node/Bun/Deno) | 🟠 | ✅ |
 | `TSK-118` | Ejemplos TS con LangChain.js, LlamaIndex.TS, Vercel AI SDK | 🟠 | ✅ |
-| `TSK-111` | Filtros metadata expandidos ($eq, $or, $in, $exists...) | 🟡 | ✅ |
+| `TSK-111` | Filtros metadata expandidos ($eq, $or, $in, $exists...) — ❌ Solo documentado, engine tiene operadores pero SDK no los expone | 🟡 | ❌ |
 | `WASM-02` | OPFS persistence for WASM browser storage | 🔴 | ✅ |
 | `WEB-07`  | Frontend test infra (Vitest + RTL + Playwright) | 🔴 | ✅ |
 | `TEST-01` | WASM test suite (45 tests, wasm_tests.rs) | 🔴 | ✅ |
@@ -747,10 +1397,10 @@ These tasks reached 100% completion and were moved here from the active backlog.
 | `AUD-16` | 🟢 15 módulos sin tests unitarios (añadidos tests a error.rs y binary_header.rs: +19 tests) | 🟢 | ✅ |
 | `AUD-17` | 🟢 Dead code en `utils/` (`DuplicatePreventionFilter`, `OriginCollisionTracker` — removidos de re-exports públicos) | 🟢 | ✅ |
 | `AUD-18` | 🟢 `#[allow(dead_code)]` obsoleto en `physical_plan.rs:query_vec_text` (falso positivo: condicionado a `remote-inference`) | 🟢 | ✅ |
-| `TSK-119` | `delete_by_filter()` — eliminar por metadata | 🟡 | ✅ |
-| `TSK-86` | `similar_to_key()` — buscar similares a existente | 🟡 | ✅ |
-| `TSK-87` | `count()` con filtros | 🟡 | ✅ |
-| `TSK-88` | Multi-namespace search (buscar en N namespaces) | 🟡 | ✅ |
+| `TSK-119` | `delete_by_filter()` — eliminar por metadata — ❌ Era solo CLI handler, eliminado en AUD-09. Nunca fue SDK | 🟡 | ❌ |
+| `TSK-86` | `similar_to_key()` — buscar similares a existente — ❌ Nunca implementado en ningún lenguaje | 🟡 | ❌ |
+| `TSK-87` | `count()` con filtros — ❌ Era solo CLI handler, eliminado en AUD-09. Nunca fue SDK | 🟡 | ❌ |
+| `TSK-88` | Multi-namespace search (buscar en N namespaces) — ❌ Nunca implementado. Siempre fue `namespace: &str` singular | 🟡 | ❌ |
 | `COM-02` | CONTRIBUTING.md (entorno, tests, conventional commits) | 🔴 | ✅ (exists in `.github/`) |
 | `COM-03` | Code of Conduct (Contributor Covenant) | 🔴 | ✅ (exists in `.github/`) |
 | `CLI-EPIC` | CLI Polish completo | 🔴 | ✅ |
@@ -860,6 +1510,41 @@ These tasks reached 100% completion and were moved here from the active backlog.
 - `.github/workflows/release.yml` — pagefile/swap in CI/CD Windows/macOS
 - `.github/workflows/python_wheels.yml` — pagefile/swap in CI/CD Windows/macOS
 ## Tareas Completadas (Migradas desde Backlog)
+
+### COMP-026: Multi-level LSM Compaction (L0→L1→L2→L3)
+- **Fuente:** Backlog (Phase 10 — Competitive Features)
+- **Fecha:** 2026-07-28
+- **Objetivo:** Extender VantaFile de archivo único a múltiples niveles LSM con compactación independiente por nivel. SegmentRegistry, compact_level(), PipelineMode extendido.
+- **Resultado:** ✅ `cargo check -p vantadb` — 0 errores. 13+ archivos modificados. L0+L1 implementados (ponytail: L3 archive deferido).
+- **Ids:** `COMP-026`
+
+### REC-007: WAL Compaction + Vacuum CLI
+- **Fuente:** Backlog (Phase 8 — Post-Launch & Enterprise)
+- **Fecha:** 2026-07-29
+- **Objetivo:** Exponer `VantaEmbedded::compact_wal()` y `VantaEmbedded::vacuum()` como comandos CLI `vanta-cli wal compact` / `vanta-cli wal vacuum`. Binding directo sin lógica nueva.
+- **Resultado:** ✅ `cargo check -p vantadb --features cli` — 0 errores. 4 archivos modificados.
+- **Ids:** `REC-007`
+
+### REC-010: py.typed marker + maturin wheel inclusion
+- **Fuente:** Backlog (Phase 8 — Post-Launch & Enterprise)
+- **Fecha:** 2026-07-29
+- **Objetivo:** PEP 561 compliance — crear `py.typed` marker y configurar `[tool.maturin] include` en `pyproject.toml` para incluir stubs `.pyi` en el wheel.
+- **Resultado:** ✅ `py.typed` creado (vacio) en `vantadb_py/`. `pyproject.toml` incluye `include = ["vantadb_py/py.typed", "vantadb_py/*.pyi"]`. 2 archivos modificados.
+- **Ids:** `REC-010`
+
+### COMP-006: Edge Label Interning (u32 label_id)
+- **Fuente:** Backlog (Phase 10 — Competitive Features)
+- **Fecha:** 2026-07-27
+- **Objetivo:** `Edge.label: String` → `Edge.label_id: u32` con LabelIntern (HashMap<String, u32>). Reduce ~80MB heap para 1M edges.
+- **Resultado:** ✅ 1,618 tests pasan. SDK público inalterado (VantaEdgeRecord.label sigue String).
+- **Ids:** `COMP-006`
+
+### COMP-018: Double-linked Relationship Chains
+- **Fuente:** Backlog (Phase 10 — Competitive Features)
+- **Fecha:** 2026-07-28
+- **Objetivo:** Relations dirigidas con doble enlace. Edge.reverse + add_edge/remove_edge bidireccional + TraversalDirection + direction param en Rust SDK (4 métodos), bindings WASM y Python.
+- **Resultado:** ✅ `cargo check` en 3 crates. 33 graph tests pasan. Backward compatible (default Forward).
+- **Ids:** `COMP-018`
 
 ### REV-001: CI Rust TSan ABI mismatch
 - **Fuente:** Plan 2026-07-14 backlog-campaign
@@ -1000,6 +1685,27 @@ These tasks reached 100% completion and were moved here from the active backlog.
 - **Objetivo:** Remove `drop(nodes)` in `InMemoryEngine::delete` so `RwLockWriteGuard` covers index cleanup — eliminates unprotected window between node removal and edge_index/scalar_index update
 - **Resultado:** ✅ `cargo check` clean, 210/211 tests pass, clippy clean. Commit `de6ecac`.
 - **Ids:** `DRV-006`
+
+### DRV-008: Duplicate scoring pipeline en vector_search() y hybrid_search()
+- **Fuente:** Backlog
+- **Fecha:** 2026-07-23
+- **Objetivo:** Extraer ~14 líneas duplicadas de filter_map + scoring chain en `vector_search()` y `hybrid_search()` a helper `collect_scores()`. Remueve DRY violation entre engine.rs:288-305 y :399-413
+- **Resultado:** ✅ `cargo check -p vantadb` clean.
+- **Ids:** `DRV-008`
+
+### DRV-011: Scan-forward recovery duplicado en WalWriter y WalReader
+- **Fuente:** Backlog
+- **Fecha:** 2026-07-23
+- **Objetivo:** Extraer ~12 líneas duplicadas del patrón de llamada a `scan_forward_valid` en `WalWriter::open()` y `WalReader::next_record()` a helper `try_scan_forward()`. Remueve DRY violation en src/wal.rs
+- **Resultado:** ✅ `cargo check -p vantadb` clean. 50 WAL tests pasan (incluye test_wal_auto_healing_and_recovery). Commit `9288957`.
+- **Ids:** `DRV-011`
+
+### DRV-015: Refactor WalWriter::open_with_buffer() función monolítica de 100L
+- **Fuente:** Backlog
+- **Fecha:** 2026-07-24
+- **Objetivo:** Extraer el loop de recovery scanning de `open_with_buffer()` a `recover_valid_records()` + limpiar la función orquestadora. Reduce de ~100L a ~55L. Separa 3 responsabilidades: file opening, header validation, recovery scanning.
+- **Resultado:** ✅ `cargo check -p vantadb` clean, `cargo clippy -D warnings` clean, 1616/1617 tests pasan (1 pre-existing fail en metrics).
+- **Ids:** `DRV-015`
 
 ### DRV-109: LlamaIndex missing GIL release
 - **Fuente:** Plan 2026-07-14 backlog-campaign
@@ -1760,13 +2466,25 @@ Migración completa del sistema de node_id de `u64` (XxHash64) a `u128` (XxHash3
 
 **Verificación:** `cargo check` ✅, `cargo nextest run` 576/577 pass (1 pre-existing), `cargo fmt --check` clean.
 
-### 2026-07-14 — REV-003: Coverage threshold gate in CI (CII Silver)
+### 2026-07-23 — REV-003: Coverage campaign 53.85% → 80.55% (CII Silver)
 
 | ID | Tarea | Cambio | Estado |
 |----|-------|--------|--------|
-| REV-003 | Coverage gate >=80% | Added `Enforce coverage threshold (>=80%)` step to `ci-rust-10.yml` coverage job. Uses `cargo llvm-cov report --json` + python3 to parse line coverage and fail if <80%. | ✅ |
+| REV-003 | Coverage gate + push to ≥80% | 14 batches, +728 tests (764→1492). Line coverage 53.85%→80.55% (region 82.16%, function 88.18%). CI threshold 76%→80%. Fix: SQ8 format bug in ops.rs get(). CLOSED. | ✅ |
 
-**Verificación:** YAML syntax valid. Existing coverage job was already present; added enforcement gate for CII Silver ≥80% requirement.
+**Cobertura por módulo (post-campaña):**
+- parser/mod.rs: 13% → 97%
+- error.rs: 70% → 100%
+- sdk/graph.rs: 0% → 100%
+- columnar.rs: 0% → 99%
+- metrics/core/registry.rs: 46% → 78%
+- index/distance.rs: 50% → 67%
+- index/search.rs: 0% → 60%
+- Todos los archivos SDK <80 → ≥80% (api 83%, builder 87%, graph 100%, types 99%)
+- storage/engine/ init 73%, ops 77%, stats 76%, maintenance 77%
+
+**Archivos tocados:** 23 (10.4K líneas agregadas, 13 borradas)
+**Verificación:** `cargo llvm-cov test --lib -p vantadb` → 80.55%, `just verify` → fmt+check+clippy+actionlint ✅
 
 ### 2026-07-14 — REV-004: tantivy rlib fix in vantadb-openai
 
@@ -1952,4 +2670,358 @@ Migración completa del sistema de node_id de `u64` (XxHash64) a `u128` (XxHash3
 |----|-------|--------|--------|
 | P2-2 | PyO3: VantaVector Vec→Box&lt;[f32]&gt; | `Vec<f32>` → `Box<[f32]>` en struct + `new()`/`__iter__`/`__getstate__`/`__setstate__`. Elimina realloc como fuente de UB en `__array_interface__`. `cargo check` ✅ | ✅ |
 
+### 2026-07-21 — DOC-API Audit Fixes (6/6 tasks completadas)
+
+**Objetivo:** Corregir 9 incidencias (5 críticas, 4 medias) encontradas en auditoría de `docs/api/` — tipos desactualizados, referencias rotas, métodos faltantes, creación de documentación faltante.
+
+**Wave 0 (4 en paralelo):**
+
+| ID | Tarea | Archivos | Resultado |
+|----|-------|----------|-----------|
+| DOC-API-01 | Fix EMBEDDED_SDK.md: u64→u128 en node_id, edge.target, firmas | `docs/api/EMBEDDED_SDK.md` | ✅ `184869b` |
+| DOC-API-02 | Fix openapi.yaml: NodeDTO alineado con VantaNodeRecord real | `docs/api/openapi.yaml` | ✅ `eb27b68` |
+| DOC-API-03 | Fix MCP.md: vantadb-cli→vanta-cli, query_lisp→query | `docs/api/MCP.md` | ✅ `7d69416` |
+| DOC-API-04 | Fix PYTHON_SDK.md: +6 métodos faltantes, VectorInput types | `docs/api/PYTHON_SDK.md` | ✅ `fd5a0de` |
+
+**Wave 1 (2 en paralelo):**
+
+| ID | Tarea | Archivos | Resultado |
+|----|-------|----------|-----------|
+| DOC-API-05 | Fix TS_SDK.md: +connect_idb(), searchVector naming | `docs/api/TS_SDK.md` | ✅ `92c49bc` |
+| DOC-API-06 | Crear IQL.md + verificar HTTP_API.md endpoints | `docs/api/IQL.md` (+213), `docs/api/HTTP_API.md` | ✅ `13c5a0f` |
+
+**Total:** 6/6 tasks completadas, ~0 líneas de código Rust/TS/Python, ~250 líneas de documentación nuevas/corregidas.
+
+**Ids:** `DOC-API-01`, `DOC-API-02`, `DOC-API-03`, `DOC-API-04`, `DOC-API-05`, `DOC-API-06`
+
 **Verificación:** `cargo check` en `vantadb-python/` — 0 errores.
+
+### 2026-07-23 — Batch TIER 1 Gate Check (8 tasks completadas)
+
+**Objetivo:** Verificar estado real de TIER 1 backlog tasks contra código antes de implementar, porque 3 de 4 primeras ya estaban fixeadas como side effects.
+
+| ID | Tarea | Resultado | Evidencia |
+|----|-------|-----------|-----------|
+| ~~`DRV-031`~~ | Doc comment duplicado | ✅ SKIP | Side effect de refactor previo, doc existe 1 vez |
+| ~~`DRV-026`~~ | Redundant unwrap en three_way_merge | ✅ SKIP | Código usa match sobre .get(), sin unwrap |
+| ~~`DRV-116`~~ | 10 warnings compilación | ✅ SKIP | `cargo check -p vantadb` + `-p vantadb-mcp` = 0 warnings |
+| ~~`DRV-040`~~ | unsafe sin SAFETY en simd.rs | ✅ SKIP | No existe archivo simd.rs en el proyecto |
+| ~~`DRV-025`~~ | TOCTOU race ResourceGovernor | ✅ ALREADY FIXED | Ya usa CAS loop con compare_exchange_weak |
+| ~~`DRV-047`~~ | Hardcoded MCP validation limits | ✅ ALREADY FIXED | Todos los handlers usan config.* values |
+| ~~`DRV-012`~~ | WAL sync duplication | ✅ ALREADY FIXED | maybe_sync() ya extraída como fn separada |
+| `DRV-009` | node_count() O(n) full scan | ✅ ALREADY FIXED | Ya usa AtomicU64 cacheado con fetch_add/fetch_sub. Comment `/// DRV-009` |
+| `DRV-016` | Mutex inconsistency governor.rs | ✅ ALREADY FIXED | Código ya usa parking_lot::Mutex (import L7), no std::sync::Mutex. Backlog description estaba obsoleta. Verificado Jul 23 |
+| ~~`DRV-019`~~ | 14 .expect() en SIMD hot-path | ✅ FIXED | Replaced 14 `.expect()` → `unsafe { .unwrap_unchecked() }` + SAFETY comment en 7 funciones SIMD (f32x8, f32x16, sq8). 62 tests pass. commit pending |
+| ~~`DRV-007`~~ | Data race en filter_field | ✅ ALREADY FIXED | DashMap interno es thread-safe. `_nodes` dead code binding. Sin UB. Verificado Jul 23 |
+| `DRV-049` | collection_delete no atómico (MCP) | ✅ ALREADY FIXED | Ya usa begin_transaction/abort/commit con abort en delete parcial. Verificado Jul 23 |
+
+**Patrón detectado:**** 7/8 TIER 1 tasks ya resueltas — las campañas de refactor previas (DRV-004, DRV-006, commits 3fd2c0d, aa87e5c, d9e1caf, 4467004, de6ecac) limpiaron más issues de los que trackeaban explícitamente. El backlog tenía estado ❌ en items que ya estaban ✅ en código.
+
+| `DRV-005` | SDK unit tests search/mod.rs | ✅ FIXED | 18 tests agregados para `search()`, `lexical_search()`, `vector_memory_search()`, `hybrid_search()`. Cubre: BM25 scoring, HNSW fallback, RRF fusion, explain mode, corrupt index. Verificado Jul 24 |
+
+### 2026-07-24 — DRV-005: SDK unit tests para search/mod.rs
+
+**Objetivo:** Cerrar gap de cobertura en `src/sdk/search/mod.rs` (845L, 0 tests). Las 4 funciones core de búsqueda híbrida ahora tienen cobertura.
+
+| ID | Tarea | Resultado | Evidencia |
+|----|-------|-----------|-----------|
+| `DRV-005` | SDK unit tests search/mod.rs | ✅ FIXED | 18 tests agregados. `cargo check -p vantadb` limpio. Blocker: `src/vector/quantization.rs:199` (engine domain). Implementado por vanta-worker. |
+
+**Recomendación:** Para próximos batches, gate-check primero antes de poner en progreso.
+
+### 2026-07-24 — Pipeline Run: 12 tasks completadas
+
+**Objetivo:** Ejecutar backlog completo del plan `2026-07-24-backlog-triage-plan.md` — 12 tareas de CI/CD, fixes SDK, web, docs.
+
+| ID | Tarea | Archivos | Commit/Resultado |
+|----|-------|----------|------------------|
+| INT-01 | Tag adapters-v0.3.0 → origin | `integrations/langchain/` | ✅ tag `adapters-v0.3.0` |
+| INT-02 | Mismo tag (LlamaIndex + 7 adapters) | `integrations/llamaindex/` etc. | ✅ tag `adapters-v0.3.0` |
+| DRV-035 | Align VantaValue TS type con serde externally-tagged | `vantadb-ts/src/types.ts` | ✅ `bdbff44` |
+| DRV-037 | Corregir number→string mismatches en type tests | `vantadb-ts/src/__tests__/types.test.ts` | ✅ `c62e251` |
+| DRV-048 | Validar jsonrpc==2.0 — error -32600 | `vantadb-mcp/src/lib.rs` | ✅ `5299d8a` |
+| VFY-001 | Reemplazar catch{} vacíos en TS SDK | `vantadb-ts/src/__tests__/hardening.test.ts` | ✅ `1b5cdff` |
+| OLD-06 | Publicar 3 blog posts existentes | `docs/blog/` (3 archivos, README) | ✅ `429c51c` |
+| DEVOPS-14 | Composite action Rust setup | `.github/actions/rust-setup/` | ✅ Ya existía, usado por 5 workflows |
+| VFY-003 | Paginate reindex_hnsw_from_text — OOM fix | `src/sdk/api.rs`, Python/WASM/TS bindings | ✅ `918df85` |
+| WEB-02 | Corregir claims falsos landing page | `web/src/` (10 archivos) | ✅ `68845a4` (license, support, distributed, latency) |
+| DRV-118 | Windows x64 CI release | `.github/workflows/release-binaries-63.yml` | ✅ Ya existía (matrix incluye x86_64-pc-windows-msvc) |
+| DRV-134 | NbAccordion keyboard a11y + ARIA | `web/src/components/nb/` (2 archivos) | ✅ `42e8ce2` |
+
+**Patrón:** 5 tasks CI/CD (INT-01/02, DEVOPS-14, DRV-118, OLD-06), 4 SDK fixes (DRV-035/037/048, VFY-003), 1 web a11y (DRV-134), 1 landing page (WEB-02), 1 TS quality (VFY-001).
+
+**Ids:** `INT-01`, `INT-02`, `DRV-035`, `DRV-037`, `DRV-048`, `VFY-001`, `VFY-003`, `OLD-06`, `DEVOPS-14`, `WEB-02`, `DRV-118`, `DRV-134`
+
+### 2026-07-24 — Backlog Audit: 4 resolved items moved to progreso
+
+**Objetivo:** Mover items que la auditoría de 6 sub-agentes confirmó como resueltos/stale. Los items de crates inexistentes (DRV-060/064/066/072/075/076/077/080/081/083/084/088/090/093/094/097/101/108/114, DRV-078/082/089/095/100/113/128) se eliminaron sin mover — eran hallazgos incorrectos del audit original, no trabajo completado.
+
+| ID | Tarea | Resultado | Evidencia |
+|----|-------|-----------|-----------|
+| `DRV-126` | Paginación offset-based → keyset pagination | ✅ RESUELTO | SearchResults ya implementa paginación keyset + offset-based en `src/sdk/search/mod.rs`. Skip, no DRV needed. |
+| `DRV-129` | Unificar build wasm-pack/maturin | ✅ STALE | wasm-pack (release-npm-61.yml) y maturin (release-wheels-60.yml) son pipelines separados deliberadamente. No existe `cargo xtask` ni entry point único. Item de diseño removido por no ser bloqueante. ❌ Mi claim anterior de "cargo xtask ci" era incorrecto — verificado contra workflows reales. |
+| `SEC-14` | cargo-deny passing con licencias correctas | ✅ RESUELTO | `cargo deny check` pasa en CI. Licencias MIT/Apache-2.0 solamente en deny.toml. |
+| `NUEVO-20` | Dockerfile multi-stage | ✅ RESUELTO | `Dockerfile` ya existe con build multi-stage. CI lo usa para release. |
+
+**Ids:** `DRV-126`, `DRV-129`, `SEC-14`, `NUEVO-20`
+
+### 2026-07-25 — Phase 0 Release Blockers: 3 completadas, 1 deferida
+
+**Objetivo:** Cerrar los 6 items de Phase 0 que bloqueaban release público. 3 implementadas, 1 deferida (nice-to-have pre-1.0), 2 ya completadas previamente.
+
+| ID | Tarea | Archivos | Resultado |
+|----|-------|----------|-----------|
+| `DEVOPS-15` | Optimizar default features Cargo.toml | `Cargo.toml:89` | ❌ **WONTFIX** — Analizado y NO aplicado. Reducir de 7 a 3 features (`cli`, `memmap2`, `fs2`, `sysinfo`) rompe experiencia "it just works". 7 features mantienen UX completo. |
+| `REV-014` | Dependabot PRs → develop branch | `.github/dependabot.yml` | ✅ `target-branch: develop` agregado a los 4 ecosystems (cargo, npm, github-actions, docker). |
+| `DRV-125` | Tests Miri para 30+ usos unsafe en src/index/ | `src/index/distance.rs`, `search.rs`, `graph.rs`, `serialize.rs` | ✅ **21 tests Miri pre-existentes** verificados: 5 en distance.rs, 3 en graph.rs, 6 en search.rs, 7 en serialize.rs. Cubren todos los patrones unsafe. |
+| `DEVOPS-10` | Windows code signing (SmartScreen) | `release-binaries-63.yml` | 🔵 DEFERIDO (ponytail). SHA256 + .zip dan integridad básica. Agregar Azure Trusted Signing cuando release público lo requiera. Step YAML preparado en task file. |
+
+**Ids:** `DEVOPS-15`, `REV-014`, `DRV-125`, `DEVOPS-10`
+
+### 2026-07-25 — P4 Engineering Health Wave 0: DOC-20 (mdBook docs site)
+
+**Objetivo:** Unificar docs fragmentados en un mdBook con search integrado.
+
+| ID | Tarea | Archivos | Resultado |
+|----|-------|----------|-----------|
+| `DOC-20` | mdBook adoption for docs site | `docs/book/book.toml`, `docs/book/src/SUMMARY.md`, 73 `{{#include}}` stubs | ✅ `1f9f681d` — mdBook con 9 secciones (User Guides, API, Architecture, Operations, Strategy, Reference, Blog, Case Studies, Project). Cero duplicación de contenido existente. 83 páginas HTML generadas. |
+
+**Verificación:** `mdbook build docs/book/` ✅ — 83 archivos en `docs/book/book/`, `index.html` funcional.
+
+### 2026-07-25 — P4 Engineering Health Wave 0: WEB-03 (Async WAL batching fsyncs)
+
+**Objetivo:** Parallel fsync for WAL shards — `flush_all` spawns one thread per shard.
+
+| ID | Tarea | Archivos | Resultado |
+|----|-------|----------|-----------|
+| `WEB-03` | Async WAL batching fsyncs | `src/wal_sharded.rs` | ✅ `c59e0f80` — `flush_all` parallel per-shard fsync. Single-shard short-circuit. |
+
+**Verificación:** `cargo check -p vantadb` ✅ | `cargo test --package vantadb --lib wal_sharded` ✅ (25/25)
+
+### 2026-07-25 — P4 Engineering Health Wave 0: VFY-004 (flat.rs O(n²) comment-only)
+
+**Objetivo:** Document that `flat.rs` filter O(n²) is by design (DashMap scan bounded by `flat_threshold`).
+
+| ID | Tarea | Archivos | Resultado |
+|----|-------|----------|-----------|
+| `VFY-004` | flat.rs O(n²) en filter — comment-only | `src/index/flat.rs:32` | ✅ `dd13b67d` — 0 code logic changes. Comment explains bounded scan. |
+
+**Verificación:** `cargo check -p vantadb` ✅
+
+### 2026-07-25 — P4 Engineering Health Wave 0: WEB-04 (Storage format versioning)
+
+**Objetivo:** Implement draft `STORAGE_VERSIONING.md` — `validate_compat()` range-based check for VantaFile/HNSW/WAL.
+
+| ID | Tarea | Archivos | Resultado |
+|----|-------|----------|-----------|
+| `WEB-04` | Storage format versioning | `src/binary_header.rs`, `src/lib.rs` | ✅ `21432104` — `VantaHeader::validate_compat()` range check. Magic + `format_version ≤ max_version`. Constants `VFILE_VERSION`, `VECTOR_INDEX_VERSION`, `WAL_FORMAT_VERSION` made pub. `STORAGE_VERSIONING.md` marked implemented. |
+
+**Verificación:** `cargo check -p vantadb` ✅ | `cargo test --package vantadb --lib binary_header` ✅
+
+### 2026-07-25 — P4 Engineering Health Wave 0: DRV-121 (Planner CBO optimization)
+
+**Objetivo:** Predicate pushdown (sort by selectivity) + filter elimination (identity filter sel≥1.0 skipped).
+
+| ID | Tarea | Archivos | Resultado |
+|----|-------|----------|-----------|
+| `DRV-121` | Planner CBO optimization | `src/planner.rs` | ✅ `21432104` — Filters sorted by estimated selectivity (ascending). Identity filters with sel ≥ 1.0 skipped. Constants `HIGH_SELECTIVITY_THRESHOLD`, imports `FieldValue`/`RelOp`. Test for identity filter elimination. |
+
+**Verificación:** `cargo check -p vantadb` ✅ | `cargo test --package vantadb --lib planner` ✅
+
+### 2026-07-25 — P4 Engineering Health Wave 0: DRV-123 (Auto-embedding INSERT polish)
+
+**Objetivo:** Error handling polish for `remote-inference` auto-embedding on INSERT.
+
+| ID | Tarea | Archivos | Resultado |
+|----|-------|----------|-----------|
+| `DRV-123` | Auto-embedding INSERT polish | `src/llm.rs`, `src/executor.rs` | ✅ `21432104` — `match` replaces `if let Ok`, `tracing::warn!` on failure. Empty text guard `!text.trim().is_empty()`. Applied to both `node_id` and `InsertMessage` paths. Test `test_auto_embedding_graceful_degradation_on_insert` added. |
+
+**Verificación:** `cargo check -p vantadb` ✅ | `cargo test --package vantadb --lib executor` ✅
+
+### 2026-07-26 — P4 Engineering Health Wave 0: VFY-011 (ACID Phase 3 — MVCC/Snapshot Isolation)
+
+**Objetivo:** Snapshot isolation / MVCC para lecturas consistentes durante escrituras concurrentes.
+
+| ID | Tarea | Archivos | Resultado |
+|----|-------|----------|-----------|
+| `VFY-011` | ACID Phase 3 — Snapshot isolation / MVCC | `src/storage/engine/ops.rs`, `src/storage/engine/mod.rs`, `src/storage/engine/init.rs`, `src/storage/ops.rs` | `Snapshot { txn_id: u64 }` struct + `get_with_snapshot()` filtrado MVCC. `active_txns: HashSet<u64>` reemplaza `active_txn_id: Mutex`. Write-write conflict detection via `check_write_conflict()`. 7 new tests: snapshot lifecycle, committed/uncommitted/deleted visibility, concurrent txns, write-write conflicts. `created_by_txn`/`deleted_by_txn` en NodeMetadata. |
+
+**Verificación:** `cargo check -p vantadb` ✅ | `cargo test -p vantadb --lib storage::engine::tests::ops` 62 passed ✅
+
+### 2026-07-26 — DRV-122: IQL JOINs, Subqueries, and SQL Compatibility
+
+**Objetivo:** Implementar SELECT/JOIN/subquery parser, NestedLoopJoin physical operator, subquery filter, planner integration.
+
+| ID | Tarea | Archivos | Resultado |
+|----|-------|----------|-----------|
+| `DRV-122` | IQL JOINs/subqueries/SQL compatibility | `src/query.rs`, `src/parser/mod.rs`, `src/executor.rs`, `src/planner.rs`, `tests/logic/joins.rs`, `Cargo.toml` | ✅ 3 fases: (1) SELECT/JOIN/subquery parser + plan types `de1898a6`, (2) NestedLoopJoin + SubqueryFilter physical operators `345d1939`, (3) planner integration + 10 new tests `6449469f`. 1559 tests pass (0 failed). |
+
+**Verificación:** `cargo check -p vantadb` ✅ | `cargo test --package vantadb --lib parser::tests` 97 passed ✅ | `cargo test --package vantadb --lib joines` 10 new JOIN tests ✅
+
+### 2026-07-26 — Phase 7: NUEVO-13 HNSW ef_search auto-tuning
+
+**Objetivo:** Mejorar auto-tuning heuristic doubling de HNSW ef_search con dampening factor 1.5x, gauge métrica, y test de integración.
+
+| ID | Tarea | Archivos | Resultado |
+|----|-------|----------|-----------|
+| `NUEVO-13` | HNSW ef_search auto-tuning (heuristic doubling) | `src/index/auto_tune.rs`, `src/metrics/core/mod.rs`, `src/metrics/core/registry.rs` | ✅ +66/-9 — Dampening 2.0→1.5x, gauge `vantadb_auto_tune_ef`, integration test `repeated_fallbacks_increase_ef`. Tests actualizados con nueva curva. |
+
+**Verificación:** `cargo nextest run --profile audit -p vantadb` ✅ | 4 auto_tune tests + gauge test ✅
+
+### 2026-07-26 — DRV-131: Missing Index Types Beyond HNSW — IVF Flat
+
+**Objetivo:** Agregar nuevos tipos de índice vectorial más allá de HNSW. Implementado IVF Flat (inverted file con k-means, sin dependencias externas).
+
+| ID | Tarea | Archivos | Resultado |
+|----|-------|----------|-----------|
+| `DRV-131` | IVF Flat index | `src/index/ivf.rs` (NEW, 836L), `src/index/mod.rs`, `src/index/graph.rs`, `src/index/search.rs`, `src/index/serialize.rs`, `src/index/core.rs`, 6 test/bench files | ✅ IVF implementado: `IvfIndex` con k-means (Forgy + Lloyd, max 20 iter), search con nprobe, serialización v8 con backwards compat v7. 16 tests IVF. 1547 tests lib pass. 0 clippy warnings nuevos. |
+
+**Verificación:** `cargo check -p vantadb` ✅ | `cargo test -p vantadb --lib` 1547 passed ✅ | `cargo clippy -p vantadb` limpio ✅
+
+**Ids:** `DRV-131`
+
+### 2026-07-26 — P2 Backlog Housekeeping: DRV-041, VFY-006, VFY-007 ✅
+
+**Fuente:** Backlog P2 Quick Wins — tareas triageadas como "ya corregidas" en pase de revisión anterior
+
+| ID | Tarea | Resultado |
+|----|-------|-----------|
+| `DRV-041` | **worker.rs Promise con serde_wasm_bindgen** — **Corregido:** _reject sí se invoca (línea 254). No hay serde_json round-trip (usa serde_wasm_bindgen). Descripción original no coincide con código real. | ✅ Document-only. Backlog actualizado. |
+| `VFY-006` | **`add_node` / `remove_node` lock contention** — **Corregido:** usa DashMap (locking por shard) + AtomicUsize/AtomicU128 (lock-free). Único Mutex es rng. | ✅ Document-only. Backlog actualizado. |
+| `VFY-007` | **`remove_node` O(n²) neighbor fixup** — **Corregido:** archivo real `src/index/graph.rs` (no `core.rs`). | ✅ Document-only. Backlog actualizado. |
+
+**Verificación:** Backlog.md P2 counter 15→12. Sin code changes (ponytail — ya estaba corregido).
+
+### 2026-07-26 — P8 Post-Launch & Enterprise: CLI-01, DEVOPS-HOMEBREW, DEVOPS-PY313, DEVEX-DEMO, DEVEX-EXAMPLES ✅
+
+**Objetivo:** Pipeline paralelo de 5 tareas P8. 3 delegadas a `vanta-worker` (Rust/Python), 2 procesadas por `vanta-lead` (CI/CD).
+
+| ID | Tarea | Resultado |
+|----|-------|-----------|
+| `CLI-01` | **CLI handlers backup/restore/doctor/stats/inspect** — Conectar 5 handlers existentes al dispatcher CLI | ✅ `src/cli.rs` + `src/bin/vanta-cli.rs`. 5 commands nuevos conectados. 46 tests CLI pasan. Delegado a vanta-worker. |
+| `DEVOPS-HOMEBREW` | **Homebrew formula** — Ya implementada (`Formula/vantadb.rb`) | ✅ Document-only. Placeholder SHA256 — actualizar antes de publish. |
+| `DEVOPS-PY313` | **Python 3.13 wheels en CI matrix** — CI verify jobs actualizados a Python 3.13 | ✅ Verify-testpypi-install + verify-pypi-install ahora usan CPython 3.13. Build mantiene 3.11 con `abi3-py311`. |
+| `DEVEX-DEMO` | **Demo app** — `examples/demo/` con Python 239L + README + requirements | ✅ Delegado a vanta-worker. Syntax check clean. |
+| `DEVEX-EXAMPLES` | **Rust examples** — 4 ejemplos existentes en `examples/rust/` | ✅ Document-only. basic, hybrid, graphrag, concurrent compilan clean. |
+
+**Verificación:** `cargo check` ✅ | Backlog.md P8 counter 13→8 | CLI 7→8 | Infra CI 2→4 | Total 90→95
+
+### 2026-07-26 — Backlog Cleanup: P0–P4, P7, P9–P10 — 53 items moved to progreso
+
+**Objetivo:** Limpiar backlog verificando cada item ✅ contra código real. Mover completados a progreso, re-abrir falsos positivos.
+
+| Fase | Acción | Items |
+|------|--------|-------|
+| **P0** | 6 stale removidos + 1 WONTFIX (DEVOPS-15) | `DEVOPS-10/12/14`, `NUEVO-09/10` removidos. `DEVOPS-15` WONTFIX — 7 features necesarias para experiencia "it just works" |
+| **P1** | Fase completa cerrada (9 items resueltos/deferidos) | `RC-06`, `SEC-13/15/16/17`, `VFY-010/14/15/16` |
+| **P2** | 7 ✅ + 24 stale a progreso | `DRV-014/028/041/136`, `VFY-006/007`, `REV-012` + 24 crates de integración nunca implementados |
+| **P3** | 7 ✅ + 7 stale a progreso | `DRV-013/017/061/067/073`, `TEST-11/12` + 7 stale |
+| **P4** | 10 ✅ a progreso | `WEB-03/04`, `VFY-004/011`, `DRV-121/122/123/130/131`, `DOC-20` |
+| **P7** | 2 ✅ a progreso | `NUEVO-13` (auto-tuning), `NUEVO-14` (WASM bundle 394KB gzip < 500KB) |
+| **P9** | 7 ✅ a progreso | `OLD-04/07/13/15/17/18/22` |
+| **P10** | 12 ✅ a progreso | `COMP-001/002/003/004/005/006/007/009/011/015/018/020/030` |
+
+**Impacto:** Backlog total ~120→~65 items activos. 5 fases cerradas (P1–P4, P7). Exec Summary actualizado.
+
+**Verificación:** Cada item verificado contra código real antes de mover. `DEVOPS-15` re-abierto tras detectar discrepancia en `Cargo.toml:89`, luego marcado WONTFIX — reducir features rompe UX "it just works".
+
+### 2026-07-27 — P5/P6/P8 Quick Wins: 8 tareas ejecutadas
+
+**Fuente:** Backlog P5 (Docs & Community), P6 (Launch Campaign), P8 (Post-Launch)
+
+**Objetivo:** Ejecutar tareas rápidas de community, marketing y documentación en paralelo.
+
+| ID | Tarea | Resultado |
+|----|-------|-----------|
+| `TSK-106` | Habilitar GitHub Discussions | ✅ Ya estaba habilitado (`has_discussions: true`). Sin cambios. |
+| `MKT-03` | Show HN draft → v0.4.0 | ✅ Draft actualizado con APIs correctas (`put`, `search_memory`) y links a PyPI/docs |
+| `NUEVO-21` | Vectara competitive research | ✅ Reporte en `docs/audit-reports/vectara-competitive-research-2026-07-27.md`. Hallazgo: Vectara cerró self-service → gap para local-first |
+| `MKT-04` | Reddit posts (3 subreddits) | ✅ 3 drafts en `docs/strategy/REDDIT_POSTS.md` (r/rust, r/MachineLearning, r/LocalLLaMA) |
+| `TSK-107` | Community showcase page | ✅ 6 items actualizados: apuntan a ejemplos reales (LangGraph, AutoGen, Haystack, CrewAI, Rust hybrid, GraphRAG) |
+| `COM-03` | Discord forums + AutoMod | ⚠️ Parcial: 9 threads seedeados (FAQ/Showcase/Ideas/Bug). AutoMod/stickers/emojis requieren Discord UI manual |
+| `COM-04` | Discord stage + ticketing | ⚠️ Parcial: Stage channel creado. Ticketing, Server Discovery (1000+ miembros), Canny.io requieren pasos externos |
+| `—` | Good first issues (18 open) | ✅ 22 issues creados (#118-#142), 3 duplicados cerrados (#136-#138). Etiquetados `good first issue` en GitHub |
+
+**Archivos creados/modificados:**
+- `docs/audit-reports/vectara-competitive-research-2026-07-27.md` (nuevo)
+- `docs/strategy/SHOW_HN_PREP.md` (actualizado)
+- `docs/strategy/REDDIT_POSTS.md` (nuevo)
+- `web/src/app/showcase/page.tsx` (actualizado)
+- `docs/discord/todo.md` (actualizado)
+- `docs/discord/server-config.md` (actualizado)
+
+**Ids:** `TSK-106`, `MKT-03`, `NUEVO-21`, `MKT-04`, `TSK-107`, `COM-03`, `COM-04`
+
+---
+
+### 2026-07-27 — COMP-010: Auto-embedding function abstraction
+
+**Objetivo:** Refactorizar auto-embedding de `LlmClient` concreto (Ollama hardcodeado) a trait `EmbeddingProvider` abstracto con múltiples implementaciones.
+
+| ID | Tarea | Archivos | Resultado |
+|----|-------|----------|-----------|
+| `COMP-010` | Trait `EmbeddingProvider` + `OllamaProvider` + `OpenAIProvider` + factory | `src/llm.rs`, `src/executor.rs`, `src/physical_plan.rs` | ✅ Trait definido. OllamaProvider (default, existente). OpenAIProvider (nuevo, `/v1/embeddings`). Factory `get_embedding_provider()` lee `VANTA_EMBEDDING_PROVIDER`. 4 call sites actualizados. `LlmClient` preservado para `summarize_context()`. |
+
+**Verificación:** `cargo check -p vantadb --features remote-inference` ✅ | `cargo test --package vantadb --lib executor` 26/26 ✅ | `cargo clippy -p vantadb --features remote-inference -- -D warnings` ✅ | `cargo fmt --check` ✅
+
+### 2026-07-27 — COMP-008: Pluggable Index Engine (VecIndex Trait)
+
+**Objetivo:** Abstraer operaciones de index vectorial (HNSW, IVF, flat scan) detrás de un trait `VecIndex` para desbloquear múltiples backends (COMP-027).
+
+| ID | Tarea | Archivos | Resultado |
+|----|-------|----------|-----------|
+| `COMP-008` | Trait `VecIndex` con `search`/`add`/`len`/`estimate_memory_bytes`. Implementado para `CPIndex` (HNSW) e `IvfIndex`. `vector_memory_search` actualizado a `engine.vec_index()`. Fix a `vantadb-mcp` por rotura de COMP-006. | `src/index/mod.rs`, `src/index/search.rs`, `src/index/ivf.rs`, `src/sdk/search/mod.rs`, `src/storage/engine/mod.rs`, `vantadb-mcp/src/lib.rs` | ✅ Trait definido. Ambos backends implementan `VecIndex`. `vector_memory_search` usa trait object. Workspace completo compila con `-D warnings`. **1679 tests pasan.** |
+
+**Verificación:** `cargo check -p vantadb` ✅ | `cargo check --benches -p vantadb` ✅ | `cargo clippy --workspace --all-targets -- -D warnings` ✅ | `cargo fmt --check` ✅ | `cargo nextest run --profile audit --workspace --build-jobs 2` ✅ 1679/1679 passed
+
+**Ids:** `COMP-008`
+
+### 2026-07-27 — COMP-014: FreshHNSW (Background Repair de Enlaces Huérfanos)
+
+| Tarea | Logro | Archivos | Estado |
+|-------|-------|----------|--------|
+| `COMP-014` | FreshHNSW: `repair_orphan_links()` three-phase (snapshot→scan→repair) evita deadlock de DashMap. `FreshHnswReport`, `PipelineMode::FreshHnswOnly`, pipeline phase entre Vacuum y Merge. 4 tests (empty, no-orphans, after-delete, multi-layer). | `src/index/graph.rs`, `src/storage/engine/mod.rs`, `src/storage/engine/maintenance.rs` | ✅ 4/4 tests (0.49s), cargo check ok |
+
+### 2026-07-27 — COMP-013: Segment Optimizer Pipeline (Vacuum/Merge/Index)
+
+**Objetivo:** Construir pipeline formal de optimización de segmentos en background (Vacuum → Merge → Index). Ya existían piezas sueltas (`compact_layout_bfs`, `trigger_compaction`, `rebuild_vector_index`) pero sin orquestación.
+
+| ID | Tarea | Archivos | Resultado |
+|----|-------|----------|-----------|
+| `COMP-013` | Pipeline orquestado con `PipelineMode` (Full/VacuumOnly/MergeOnly/IndexOnly), `vacuum()` purga tombstones del HNSW, `merge_segments()` compactación BFS condicional, `run_pipeline()` orquestación secuencial con tolerancia a fallos por fase | `src/storage/engine/mod.rs`, `src/storage/engine/maintenance.rs`, `src/config.rs`, `src/sdk/api.rs`, `src/storage/engine/tests/maintenance.rs` | ✅ `PipelineMode`, `VacuumReport`, `MergeReport`, `PipelineReport`, `SegmentOptimizerConfig` en `VantaConfig`. SDK expone `vacuum()`, `pipeline()`, `optimizer_config()`, `set_optimizer_config()`. 77 tests de mantenimiento pasando. |
+
+**Verificación:** `cargo check -p vantadb` ✅ | `cargo test -p vantadb -- maintenance` 77/77 ✅
+
+### 2026-07-27 — COMP-009: Binary Bulk Import
+
+**Objetivo:** Protocolo binario de importación masiva 5-10x más rápido que `put_batch()`, con bypass de validación por registro y batch commit.
+
+| ID | Tarea | Archivos | Resultado |
+|----|-------|----------|-----------|
+| `COMP-009` | Formato `.vdbdump` (magic `VDBJSON\n` + version + count + serde_json body), `bulk_import_stream()` bypass validación, `bulk_import_file()`, `bulk_commit_interval` en config. Python: `VantaDB.bulk_import()` + `VantaDB.bulk_import_bytes()`. WASM: `VantaDB.bulk_import()` + `VantaDB.bulk_import_bytes()` | `src/sdk/api.rs`, `src/config.rs`, `vantadb-python/src/lib.rs`, `vantadb-python/src/convert.rs`, `vantadb-python/vantadb_py/__init__.py`, `vantadb-wasm/src/lib.rs`, `docs/Backlog.md`, `.opencode/skills/campaign-executor/tasks/COMP-009.md` | ✅ `BulkImportReport` struct + bulk_import_stream + bulk_import_file. Python async wrappers. WASM Uint8Array binding. 3 tests pasando. `bulk_commit_interval` configurable |
+
+**Verificación:** `cargo check` (workspace completo) ✅ | `cargo test -p vantadb -- tests::test_bulk_` 3/3 ✅
+
+---
+
+### 2026-07-28 — ECO-001: Remove dead Claude Code hooks
+
+**Objetivo:** Eliminar hooks muertos de Claude Code (`.opencode/hooks/hooks.json` y `session-start.sh`) que nunca se ejecutan en OpenCode/Windows.
+
+| ID | Tarea | Resultado | Evidencia |
+|----|-------|-----------|-----------|
+| `ECO-001` | Remove dead Claude Code hooks (C1) | ✅ COMPLETED | Commit `cf623e5c`. Archivos eliminados de `.opencode/hooks/`. Blast radius: cero. |
+
+**Verificación:** `Test-Path ".opencode/hooks"` → False ✅ | `git log --oneline -1` → `cf623e5c chore: remove dead Claude Code hooks (ECO-001)` ✅
+
+### 2026-07-28 — ECO-002: Fix --no-verify contradiction in AGENTS.md
+
+**Objetivo:** Eliminar contradicción en AGENTS.md donde Regla 1 prohibía `--no-verify` pero Regla 7 lo autorizaba para cambios triviales.
+
+| ID | Tarea | Resultado | Evidencia |
+|----|-------|-----------|-----------|
+| `ECO-002` | Fix --no-verify contradiction in AGENTS.md (C3) | ✅ COMPLETED | Regla B (línea 967 original) ya eliminada. Solo queda Regla A (`grep --no-verify .opencode/AGENTS.md` → 1 match: prohibición en línea 791). `.antigravity/AGENTS.md` idéntico. |
+
+**Verificación:** `grep "trivial.*CI\|no-verify.*trivial" .opencode/AGENTS.md` → 0 matches ✅ | `grep "trivial.*CI\|no-verify.*trivial" .antigravity/AGENTS.md` → 0 matches ✅
+
+

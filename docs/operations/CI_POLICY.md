@@ -3,7 +3,7 @@ title: "VantaDB CI & Certification Policy"
 type: operations
 status: active
 tags: [vantadb, operations]
-last_reviewed: 2026-07-01
+last_reviewed: 2026-07-21
 aliases: []
 ---
 
@@ -12,9 +12,12 @@ aliases: []
 To maintain a rapid development iteration cycle and guarantee mathematical precision in our HNSW
 engine, VantaDB enforces a split Continuous Integration architecture.
 
-## The Two-Tiered CI Architecture
+## CI Workflow Inventory
 
-### 1. The Fast Gate (`rust_ci.yml`)
+VantaDB has **14 active workflow files** in `.github/workflows/` (numbered by layer for dependency
+ordering). Each workflow is documented below.
+
+### 1. Fast Gate (`ci-rust-10.yml`)
 
 The fast gate is triggered automatically on every pull request and push to the `main` branch.
 **Goal:** Deliver PR feedback in under 5 minutes.
@@ -25,13 +28,24 @@ v1, rebuild/audit, and local deterministic integration tests. Historical or expe
 such as IQL/LISP/DQL, MCP, LLM/Ollama integration, graph traversal beyond stored local edges, and
 governance semantics are excluded from the default fast lane.
 
-**What it runs:**
+**Jobs:**
 
-- Static analysis: `cargo fmt` and `cargo clippy`.
-- Unit tests and fast integration tests (`cargo test --test <name>`).
-- API contract verifications that do not depend on external systems.
-- Embedded CLI diagnostics such as `audit-index`, when covered through local integration tests and
-  temporary database directories.
+| Job | Description |
+|-----|-------------|
+| `fmt` | Format Check — `cargo fmt --check` |
+| `clippy` | Clippy Lints — `cargo clippy -- -D warnings` |
+| `test` | Tests (Linux) — nextest audit profile |
+| `test-windows` | Tests (Windows) — nextest ci-windows profile |
+| `test-macos` | Tests (macOS) — nextest audit profile |
+| `msrv` | MSRV Check (1.94.1) |
+| `minimal-versions` | Minimal Versions Check (`-Zminimal-versions`, nightly, continue-on-error) |
+| `coverage` | Code Coverage (`cargo-llvm-cov`, ≥59% threshold) |
+| `audit` | Security Audit (`cargo audit`) |
+| `miri` | Miri UB Detection (nightly) |
+| `deny` | Dependency Policy Check (`cargo deny`) |
+| `experimental-check` | Experimental Crates Check (continue-on-error, non-blocking) |
+| `sanitizer-asan` | AddressSanitizer (nightly, continue-on-error) |
+| `sanitizer-tsan` | ThreadSanitizer (nightly, continue-on-error) |
 
 **Strict Rules for the Fast Gate:**
 
@@ -40,6 +54,34 @@ governance semantics are excluded from the default fast lane.
   required).
 - **Fast:** Any test exceeding a few seconds must be moved to heavy certification or heavily
   optimized.
+
+### Experimental Crate Circuit Breaker
+
+The workspace includes several **experimental crates** that are not part of the core MVP:
+
+| Crate | Description | Status |
+|-------|-------------|--------|
+| `vantadb-server` | Local HTTP/gRPC server | Experimental |
+| `vantadb-mcp` | Model Context Protocol interface | Experimental |
+| `vantadb-wasm` | WASM bindings for JS/TS SDK | Experimental |
+| `vantadb-openai` | OpenAI embedding adapter | Experimental |
+| `vantadb-ollama` | Ollama embedding adapter | Experimental |
+| `vantadb-litellm` | LiteLLM embedding adapter | Experimental |
+
+**Circuit breaker rules:**
+
+1. **Removed from `default-members`** in root `Cargo.toml` — `cargo check`, `cargo build`, and
+   `cargo test` without `--workspace` skip them entirely.
+2. **Excluded from `--workspace` clippy** — the `--exclude` flag is used for all three platforms
+   (Linux, Windows, macOS) so lint failures in experimental code do not block CI.
+3. **Excluded from `--workspace` coverage** — the `cargo llvm-cov nextest` step uses `--exclude` so
+   compilation or test failures in experimental code do not block coverage reporting.
+4. **Dedicated `experimental-check` job** — runs `cargo check` on all experimental crates with
+   `continue-on-error: true`. This provides visibility into experimental crate health without
+   blocking the fast lane.
+
+**To promote an experimental crate to stable**, remove it from the exclusion list in
+`ci-rust-10.yml` and re-add it to `default-members` in `Cargo.toml`.
 
 ### Experimental Suite
 
@@ -53,33 +95,79 @@ cargo nextest run --profile experimental --workspace --features experimental
 Failures in this suite should be triaged, but they do not block the Fast Gate unless the failure is
 caused by a change to production-facing MVP behavior.
 
-### 2. Heavy Certification (`heavy_certification.yml`)
+### 2. Heavy Certification (`heavy-certification-50.yml`)
 
 The heavy certification suite validates the engine's capability to run under production stress,
 ensuring recall guarantees and scaling limits. **Goal:** Validate engine stability, recall, and
 scale capabilities without bottlenecking daily development.
 
-**What it runs:**
+**Jobs:**
 
-- `stress_protocol`: Validates dynamic scaling (10K, 50K, 100K vectors), persistence, latency, and
-  0.95+ Recall@10.
-- `hnsw_validation` & `hnsw_recall_certification`.
-- `sift_validation` (optional): Tests the engine against standard public datasets.
-- `competitive_bench` (optional): Validates against FAISS/HNSWlib.
-- `mcp_tests` (package `vantadb-mcp`), `multilingual_tokenizer_integration`, `columnar`, `memory_telemetry`, and the unit test `concurrent_insert_preserves_hnsw_invariants`: Validates integration boundaries, memory telemetry contracts, and resource-heavy/slow unit tests that are excluded from the default Fast Gate.
-- `chaos_integrity`, `wal_resilience`, `crash_injection` (failpoint-tests job): Validates crash recovery with `--features failpoints`; also excluded from the Fast Gate.
+| Job | Description |
+|-----|-------------|
+| `stress-protocol` | Dynamic scaling (10K, 50K, 100K vectors), persistence, latency, 0.95+ Recall@10 |
+| `hnsw-validation` | HNSW validation |
+| `hnsw-recall` | HNSW recall certification |
+| `sift-validation` | SIFT-1M validation (manual opt-in) |
+| `competitive-bench` | Competitive benchmarks vs FAISS/HNSWlib (manual opt-in) |
+| `failpoint-tests` | `chaos_integrity`, `wal_resilience`, `crash_injection` — crash recovery with `--features failpoints` |
+| `storage-persistence` | Storage persistence & recovery (backend, durability, GC, schema evolution, etc.) |
+| `text-index` | Text index recovery (`text_index_recovery`) |
+| `memory-concurrency` | Memory & concurrency heavy tests (concurrency, memory brutality, fuzz proptest) |
+| `other-heavy` | Remaining heavy tests: CLI, benchmarks, hybrid ranking, MCP (`vantadb-mcp`), columnar, `concurrent_insert_preserves_hnsw_invariants` |
 
 **Why are these tests separated?** Running `stress_protocol` can take close to 2 hours on hosted
 runners and requires significant system resources (AVX2 plus heavy swap). It runs in its own
 scheduled/manual job with a 150 minute step timeout so it can complete without blocking the other
 certification checks. Running this on every PR would paralyze development velocity.
 
-### 3. Python Wheel Certification (`python_wheels.yml`)
+### 3. Web CI (`ci-web-11.yml`)
 
-The wheel workflow builds the Python SDK on Linux, macOS, and Windows with `maturin`, installs the
-generated wheel by resolved path, and runs the Python SDK smoke suite. Manual TestPyPI upload is
-available only through an explicit workflow input and the `TEST_PYPI_API_TOKEN` secret. Production
-PyPI publication and signing remain deferred.
+Builds and lints the web frontend (`web/` directory — Next.js 16). Runs `npm ci`, `npm run lint`,
+`npx tsc --noEmit`, and `npm run build` on push/PR to `main` that touches `web/**`. No test infra
+— the Next.js SPA is client-only (`"use client"` everywhere). Triggered by `workflow_dispatch` as
+well.
+
+### 4. Docs Gate (`gate-docs-21.yml`)
+
+Lints Markdown files in `docs/**` with `markdownlint-cli2`. Triggered on push/PR to `main`
+touching docs.
+
+### 5. Security Scan (`sec-codeql-30.yml`)
+
+CodeQL analysis for Rust. Runs on push/PR to `main` and weekly. Triggers via `workflow_dispatch`.
+
+### 6. Fuzzing (`fuzz-40.yml`)
+
+LibFuzzer corpus + regression via `cargo fuzz`. Scheduled weekly (Monday 06:00 UTC) or
+`workflow_dispatch`.
+
+### 7. Performance Benchmarks (`perf-bench-40.yml`)
+
+Python integration performance benchmarks. Triggered on push to `main` touching core or
+Python paths, or via `workflow_dispatch` with configurable vector/queries/dim inputs.
+
+### 8. Nightly Benchmarks (`heavy-bench-nightly-51.yml`)
+
+Nightly benchmark regression suite (daily CRON plus `workflow_dispatch`). Runs light benchmarks
+and heavy benchmarks across multiple package scopes.
+
+### 9. Python Wheel Build & Publish (`release-wheels-60.yml`)
+
+Builds the Python SDK on Linux, macOS, and Windows with `maturin`, installs the generated wheel
+by resolved path, and runs the Python SDK smoke suite. Manual TestPyPI upload is available only
+through an explicit workflow input and the `TEST_PYPI_API_TOKEN` secret. Production PyPI
+publication and signing remain deferred.
+
+### 10. Release Workflows
+
+| Workflow | File | Trigger |
+|----------|------|---------|
+| Release Automation | `release.yml` | Push to `main` — `release-plz` auto-version, changelog, tag, publish |
+| NPM Publish | `release-npm-61.yml` | Tag `wasm-v*.*.*` / `ts-v*.*.*` or `workflow_dispatch` |
+| PyPI Adapters | `release-adapters-62.yml` | Tag `adapters-v*.*.*` or `workflow_dispatch` (TestPyPI) |
+| Binary Builds | `release-binaries-63.yml` | Release published or `workflow_dispatch` |
+| SBOM Generation | `release-sbom-64.yml` | Tag `v*` or `workflow_dispatch` |
 
 ## External Dependencies (Ollama/LLMs)
 
@@ -90,12 +178,12 @@ They are either marked with `#[ignore]` or gated behind environment variables (e
 
 ## Running Heavy Certification Manually
 
-The `heavy_certification.yml` workflow runs automatically via a CRON schedule (e.g., weekly on
-Sundays). The scheduled lane runs the local deterministic core certification jobs. SIFT-1M
-validation and competitive benchmarks are manual opt-ins because they require external datasets. You
-can also trigger it manually from the GitHub Actions UI:
+The `heavy-certification-50.yml` workflow runs automatically via a CRON schedule (weekly on
+Sundays at 03:00 UTC). The scheduled lane runs the local deterministic core certification jobs.
+SIFT-1M validation and competitive benchmarks are manual opt-ins because they require external
+datasets. You can also trigger it manually from the GitHub Actions UI:
 
 1. Navigate to the **Actions** tab in the repository.
-2. Select **VantaDB Heavy Certification** from the left sidebar.
+2. Select **HEAVY: Certification — All Tests** from the left sidebar.
 3. Click **Run workflow**.
 4. You can optionally check the boxes to include `SIFT-1M validation` or `Competitive benchmarks`.

@@ -20,7 +20,7 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
 use std::time::Instant;
-use vantadb::index::{cosine_sim_f32, CPIndex, HnswConfig, VectorRepresentations};
+use vantadb::index::{cosine_sim_f32, CPIndex, HnswConfig, IndexType, VectorRepresentations};
 use vantadb::node::FilterBitset;
 
 #[path = "../common/mod.rs"]
@@ -155,6 +155,8 @@ fn config_base() -> HnswConfig {
         ml: 1.0 / (32_f64).ln(),
         distance_metric: vantadb::node::DistanceMetric::Cosine,
         flat_threshold: None,
+        index_type: IndexType::Hnsw,
+        auto_tune: false,
     }
 }
 
@@ -168,6 +170,8 @@ fn config_50k_high() -> HnswConfig {
         ml: 1.0 / (32_f64).ln(),
         distance_metric: vantadb::node::DistanceMetric::Cosine,
         flat_threshold: None,
+        index_type: IndexType::Hnsw,
+        auto_tune: false,
     }
 }
 
@@ -222,6 +226,8 @@ fn stress_protocol_certification() {
             ml: 1.0 / (16_f64).ln(),
             distance_metric: vantadb::node::DistanceMetric::Cosine,
             flat_threshold: None,
+            index_type: IndexType::Hnsw,
+            auto_tune: false,
         };
         let index = build_index(&dataset, config);
         let recall = compute_recall(&index, &queries, &dataset, K);
@@ -270,6 +276,8 @@ fn stress_protocol_certification() {
                 ml: 1.0 / (32_f64).ln(),
                 distance_metric: vantadb::node::DistanceMetric::Cosine,
                 flat_threshold: None,
+                index_type: IndexType::Hnsw,
+                auto_tune: false,
             };
             let t0 = Instant::now();
             let idx_100k = build_index(&ds, config_100k);

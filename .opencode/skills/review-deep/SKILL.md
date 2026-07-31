@@ -10,7 +10,7 @@ compatibility: opencode
 
 # Review Deep — Loop de Revisión Profunda
 
-> **Diferencia con vantadb-full-review:** no es un reporte one-shot.
+> **Diferencia con unified-review (legacy vantadb-full-review):** no es un reporte one-shot.
 > Es un **loop que itera módulo por módulo**, investiga cada hallazgo en internet,
 > compara con competidores, evalúa prioridad real, y lo agrega a Backlog.md.
 > Corre tantas iteraciones como módulos tenga el proyecto.
@@ -38,7 +38,7 @@ compatibility: opencode
   ├─ FASE 2: Static analysis (tools mecánicos)
   │   ├─ Rust: cargo check, clippy -D, machete, outdated, audit, deny
   │   ├─ Python: mypy, pytest, ruff
-  │   ├─ TS: tsc --noEmit, eslint, vitest
+  │   ├─ TS: tsc --noEmit, eslint, vitest (TS SDK only; web/ uses next build)
   │   └─ Registrar: warnings, errors, issues
   │
   ├─ 🟢 QUALITY GATE 1 (entre F3→F4)
@@ -236,6 +236,16 @@ cd vantadb-ts/
 npx tsc --noEmit 2>&1
 npx eslint . --ext .ts 2>&1
 npx vitest run 2>&1
+```
+
+### Para Web (Next.js)
+
+```bash
+cd web/
+npm ci --ignore-scripts
+npm run lint
+npx tsc --noEmit
+npm run build
 ```
 
 ### Para adaptadores

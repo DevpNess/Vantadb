@@ -4,11 +4,13 @@
 mod api;
 pub(crate) mod builder;
 pub mod connect;
+mod gds;
 mod graph;
 mod search;
-mod serialization;
+pub(crate) mod serialization;
 pub(crate) mod types;
 
+pub use api::BulkImportReport;
 pub use builder::VantaEmbedded;
 pub use connect::connect;
 pub use serialization::{
@@ -17,10 +19,11 @@ pub use serialization::{
 };
 pub use types::{
     VantaBm25TermContribution, VantaCapabilities, VantaEdgeRecord, VantaExportReport, VantaFields,
-    VantaHybridFusionReport, VantaImportReport, VantaIndexRebuildReport, VantaMemoryInput,
-    VantaMemoryListOptions, VantaMemoryListPage, VantaMemoryMetadata, VantaMemoryRecord,
-    VantaMemorySearchHit, VantaMemorySearchRequest, VantaNodeInput, VantaNodeRecord,
-    VantaOperationalMetrics, VantaQueryResult, VantaRuntimeProfile, VantaSearchExplanation,
-    VantaSearchExplanationHit, VantaSearchHit, VantaStorageTier, VantaTextIndexAuditReport,
-    VantaTextIndexRepairReport, VantaValue,
+    VantaFilterOp, VantaHybridFusionReport, VantaImportReport, VantaIndexRebuildReport,
+    VantaMemoryFilter, VantaMemoryFilterItem, VantaMemoryInput, VantaMemoryListOptions,
+    VantaMemoryListPage, VantaMemoryMetadata, VantaMemoryRecord, VantaMemorySearchHit,
+    VantaMemorySearchRequest, VantaNodeInput, VantaNodeRecord, VantaOperationalMetrics,
+    VantaQueryResult, VantaRuntimeProfile, VantaSearchExplanation, VantaSearchExplanationHit,
+    VantaSearchHit, VantaStorageTier, VantaTextIndexAuditReport, VantaTextIndexRepairReport,
+    VantaValue,
 };

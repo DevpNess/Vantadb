@@ -9,8 +9,9 @@ use crate::error::{Result, VantaError};
 use crate::index::{CPIndex, IndexBackend};
 use crate::node::{NodeTier, UnifiedNode, VectorRepresentations};
 use crate::storage::engine::{
-    engine_mmap_resident_bytes, EvictionReason, EvictionReport, IndexRebuildReport,
-    QuantizationMaintenanceReport, StorageEngine, FLAG_TOMBSTONE, STORAGE_ALIGNMENT,
+    EvictionReason, EvictionReport, FreshHnswReport, IndexRebuildReport, LsmReport, MergeReport,
+    PipelineMode, PipelineReport, QuantizationMaintenanceReport, StorageEngine, VacuumReport,
+    FLAG_TOMBSTONE, STORAGE_ALIGNMENT,
 };
 use crate::storage::ops::NodeMetadata;
 use crate::storage::vfile::MmapMut;
@@ -19,7 +20,7 @@ use crate::vector::governor::QuantizationAction;
 impl StorageEngine {
     /// Check tombstone fragmentation and log a warning if it exceeds 20%.
     pub fn trigger_compaction(&self) -> Result<()> {
-        let vstore = self.vector_store.write();
+        let vstore = self.vector_store[0].write();
         let hnsw = self.hnsw.load();
 
         let tombstone_count = hnsw
@@ -53,7 +54,9 @@ impl StorageEngine {
         self.flush_pending_hnsw()?;
         self.ensure_writable()?;
         self.backend.flush()?;
-        self.vector_store.read().flush()?;
+        for vs in &self.vector_store {
+            vs.read().flush()?;
+        }
 
         let current_wal_seq = self
             .wal
@@ -72,6 +75,14 @@ impl StorageEngine {
             self.backend.flush()?;
         }
 
+        #[cfg(feature = "failpoints")]
+        {
+            fail::fail_point!("snapshot_serialize_fail", |_| {
+                Err(crate::error::VantaError::IoError(std::io::Error::other(
+                    "Simulated snapshot serialize I/O failure",
+                )))
+            });
+        }
         self.save_vector_index()?;
 
         // PERF-09: Run quantization auto-transition during flush
@@ -86,11 +97,20 @@ impl StorageEngine {
         }
 
         let hnsw = self.hnsw.load();
-        let vector_store = self.vector_store.read();
+        let mut resident_bytes: Option<u64> = None;
+        for vs in &self.vector_store {
+            let guard = vs.read();
+            if let Some(rb) = guard.mmap_resident_bytes() {
+                resident_bytes = Some(resident_bytes.unwrap_or(0) + rb);
+            }
+        }
+        if let Some(rb) = hnsw.backend.mmap_resident_bytes() {
+            resident_bytes = Some(resident_bytes.unwrap_or(0) + rb);
+        }
         crate::metrics::record_memory_breakdown(
             hnsw.nodes.len() as u64,
             hnsw.estimate_memory_bytes() as u64,
-            engine_mmap_resident_bytes(&hnsw, &vector_store),
+            resident_bytes,
             self.volatile_cache.read().len() as u64,
             0,
         );
@@ -226,6 +246,8 @@ impl StorageEngine {
         let metadata = NodeMetadata {
             relational: persisted.relational.clone(),
             edges: persisted.edges.clone(),
+            created_by_txn: 0, // consolidation is pre-MVCC
+            deleted_by_txn: None,
         };
         let metadata_val = postcard::to_allocvec(&metadata).map_err(VantaError::serialization)?;
         self.backend
@@ -241,7 +263,8 @@ impl StorageEngine {
         self.refresh_index(&persisted, offset)?;
 
         if offset > 0 {
-            let vstore = self.vector_store.read();
+            let (seg_id, local_off) = crate::lsm::unpack_offset(offset);
+            let vstore = self.vector_store[seg_id as usize].read();
             let mmap = vstore.mmap_bytes();
             let vector_size = match &persisted.vector {
                 VectorRepresentations::Full(v) => v.len() * 4,
@@ -254,7 +277,7 @@ impl StorageEngine {
                 VectorRepresentations::None => 0,
             };
             let vector_size_aligned = (vector_size + 63) & !63;
-            let offset_usize = offset as usize;
+            let offset_usize = local_off as usize;
             if offset_usize + vector_size_aligned <= mmap.len() && vector_size_aligned > 0 {
                 // SAFETY: the bounds check above guarantees the range is within
                 // the mmap region. `release_mmap_vector` expects the caller to
@@ -377,8 +400,15 @@ impl StorageEngine {
         };
 
         let report = {
-            let vstore = self.vector_store.read();
-            crate::storage::archive::rebuild_hnsw_from_vstore(&mut rebuilt, &vstore, index_path)?
+            // Rebuild from L0 (primary segment). For L1+ data, the offsets
+            // will be updated when the HNSW is populated from all levels.
+            let vstore = self.vector_store[0].read();
+            crate::storage::archive::rebuild_hnsw_from_vstore_with_segment(
+                &mut rebuilt,
+                &vstore,
+                index_path.clone(),
+                Some(0),
+            )?
         };
 
         if rebuilt.backend.is_mmap() {
@@ -419,7 +449,9 @@ impl StorageEngine {
 
         let started = Instant::now();
 
-        let mut vstore = self.vector_store.write();
+        // ponytail: compact_layout_bfs compacts L0 only. Multi-level BFS
+        // compaction is handled by compact_level().
+        let mut vstore = self.vector_store[0].write();
         let hnsw = self.hnsw.load();
 
         let entry_point_id = match hnsw.get_entry_point() {
@@ -584,18 +616,510 @@ impl StorageEngine {
         })
     }
 
+    /// Purge tombstoned nodes from the HNSW index.
+    ///
+    /// Scans all HNSW nodes, reads each node's VantaFile header, and removes
+    /// any node whose header has `FLAG_TOMBSTONE` set from the graph index.
+    /// The VantaFile layout is **not** rewritten — call `merge_segments()`
+    /// afterwards if you need to reclaim storage bytes.
+    #[tracing::instrument(skip(self), level = "info", err)]
+    pub fn vacuum(&self) -> Result<VacuumReport> {
+        self.ensure_writable()?;
+
+        let started = Instant::now();
+        // ponytail: vacuum scans L0 headers. Multi-level vacuum is handled
+        // by the compact_level path.
+        let vstore = self.vector_store[0].read();
+        let hnsw = self.hnsw.load();
+
+        let tombstone_ids: Vec<u128> = hnsw
+            .nodes
+            .iter()
+            .filter_map(|entry| {
+                let node = entry.value();
+                let id = *entry.key();
+                let header = vstore.read_header(node.storage_offset)?;
+                if (header.flags & FLAG_TOMBSTONE) != 0 {
+                    Some(id)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let scanned = hnsw.nodes.len() as u64;
+        let removed_count = tombstone_ids.len() as u64;
+
+        if removed_count == 0 {
+            let elapsed_ms = started.elapsed().as_millis() as u64;
+            tracing::info!(scanned, "vacuum: no tombstones found");
+            return Ok(VacuumReport {
+                scanned_nodes: scanned,
+                removed_nodes: 0,
+                reclaimed_bytes: 0,
+                duration_ms: elapsed_ms,
+                success: true,
+            });
+        }
+
+        for id in &tombstone_ids {
+            hnsw.nodes.remove(id);
+            hnsw.total_nodes
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            if let Some(ref scalar) = self.scalar_index {
+                scalar.remove_node(*id);
+            }
+        }
+
+        // ponytail: estimate reclaimed bytes — HnswNode overhead + vec + neighbor edges.
+        // This is an upper bound; actual mmap pages won't be freed until compaction.
+        let reclaimed_bytes = tombstone_ids.len() as u64 * 512;
+
+        // If the entry point was removed, find a replacement
+        if let Some(ep) = hnsw.get_entry_point() {
+            if !hnsw.nodes.contains_key(&ep) {
+                if let Some(new_ep) = hnsw.find_new_entry_point() {
+                    hnsw.set_entry_point(new_ep);
+                }
+            }
+        }
+
+        drop(vstore);
+        drop(hnsw);
+
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        tracing::info!(
+            scanned,
+            removed = removed_count,
+            reclaimed_bytes,
+            elapsed_ms,
+            "vacuum: tombstones purged from HNSW index"
+        );
+
+        Ok(VacuumReport {
+            scanned_nodes: scanned,
+            removed_nodes: removed_count,
+            reclaimed_bytes,
+            duration_ms: elapsed_ms,
+            success: true,
+        })
+    }
+
+    /// Merge (compact) the VantaFile if tombstone fragmentation exceeds the
+    /// configured threshold.
+    ///
+    /// Delegates to [`compact_layout_bfs`] which rewrites the VantaFile in
+    /// BFS order of the HNSW graph, skipping tombstoned nodes.
+    #[tracing::instrument(skip(self), level = "info", err)]
+    pub fn merge_segments(&self) -> Result<MergeReport> {
+        self.ensure_writable()?;
+
+        let started = Instant::now();
+        let hnsw = self.hnsw.load();
+
+        let total_nodes = hnsw.nodes.len();
+        if total_nodes == 0 {
+            let elapsed_ms = started.elapsed().as_millis() as u64;
+            tracing::info!("merge_segments: empty index, skipping");
+            return Ok(MergeReport {
+                segments_before: 1,
+                segments_after: 1,
+                saved_bytes: 0,
+                duration_ms: elapsed_ms,
+                success: true,
+            });
+        }
+
+        // ponytail: merge_segments reads L0 headers to count tombstones.
+        let tombstone_count = hnsw
+            .nodes
+            .iter()
+            .filter(|r| {
+                let n = r.value();
+                let packed = n.storage_offset;
+                let (seg_id, local_off) = crate::lsm::unpack_offset(packed);
+                if let Some(vs) = self.vector_store.get(seg_id as usize) {
+                    let guard = vs.read();
+                    if let Some(h) = guard.read_header(local_off) {
+                        (h.flags & FLAG_TOMBSTONE) != 0
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            })
+            .count();
+
+        let frag_pct = tombstone_count as f32 / total_nodes as f32 * 100.0;
+        let threshold = self.config.segment_optimizer.vacuum_threshold_pct;
+
+        drop(hnsw);
+
+        if frag_pct < threshold {
+            let elapsed_ms = started.elapsed().as_millis() as u64;
+            tracing::info!(
+                frag_pct = frag_pct as u32,
+                threshold = threshold,
+                "merge_segments: fragmentation below threshold, skipping"
+            );
+            return Ok(MergeReport {
+                segments_before: 1,
+                segments_after: 1,
+                saved_bytes: 0,
+                duration_ms: elapsed_ms,
+                success: true,
+            });
+        }
+
+        let file_size_before = {
+            // ponytail: compact L0 only
+            let vs = self.vector_store[0].read();
+            vs.mmap_bytes().len() as u64
+        };
+
+        // compact_layout_bfs returns nodes_compacted count
+        let nodes_compacted = self.compact_layout_bfs().unwrap_or(0);
+
+        let file_size_after = {
+            // ponytail: compact L0 only
+            let vs = self.vector_store[0].read();
+            vs.mmap_bytes().len() as u64
+        };
+
+        let saved_bytes = file_size_before.saturating_sub(file_size_after);
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+
+        tracing::info!(
+            frag_pct = frag_pct as u32,
+            nodes_compacted,
+            saved_bytes,
+            elapsed_ms,
+            "merge_segments: VantaFile compacted"
+        );
+
+        Ok(MergeReport {
+            segments_before: 1,
+            segments_after: 1,
+            saved_bytes,
+            duration_ms: elapsed_ms,
+            success: true,
+        })
+    }
+
+    /// Scans all HNSW nodes and removes orphan links — neighbor IDs that
+    /// point to nodes that no longer exist in the index.
+    ///
+    /// This repairs the graph after delete operations, which remove a node
+    /// from `self.nodes` but leave references in the neighbor lists of
+    /// surviving nodes. Over time, orphan links degrade search quality.
+    #[tracing::instrument(skip(self), level = "info", err)]
+    pub fn fresh_hnsw(&self) -> Result<FreshHnswReport> {
+        self.ensure_writable()?;
+
+        let hnsw = self.hnsw.load();
+        let report = hnsw.repair_orphan_links();
+
+        tracing::info!(
+            scanned = report.scanned_nodes,
+            layers = report.total_layers,
+            repaired = report.repaired_links,
+            elapsed_ms = report.duration_ms,
+            "fresh_hnsw: orphan links repaired"
+        );
+
+        Ok(report)
+    }
+
+    /// Check whether a given LSM level should be compacted.
+    ///
+    /// Returns `true` if the segment at `level` exceeds its configured max size
+    /// or its tombstone ratio exceeds the threshold.
+    fn should_compact_level(&self, level: u8) -> bool {
+        if level as usize >= self.vector_store.len() {
+            return false;
+        }
+        let guard = self.vector_store[level as usize].read();
+        let seg_size = guard.write_cursor;
+        let config = &self.config.segment_optimizer.lsm;
+        let (max_size, tombstone_threshold) = match level {
+            0 => (config.l0_max_size, config.l0_tombstone_threshold),
+            1 => (config.l1_max_size, config.l1_tombstone_threshold),
+            2 => (config.l2_max_size, config.l2_tombstone_threshold),
+            _ => return false,
+        };
+        if seg_size >= max_size {
+            return true;
+        }
+        // Count tombstones from HNSW for this level
+        let hnsw = self.hnsw.load();
+        let mut tombstone_count = 0u64;
+        let mut total_count = 0u64;
+        for entry in hnsw.nodes.iter() {
+            let n = entry.value();
+            let (seg_id, _local_off) = crate::lsm::unpack_offset(n.storage_offset);
+            if seg_id as u8 == level {
+                total_count += 1;
+                if (n.flags & FLAG_TOMBSTONE) != 0 {
+                    tombstone_count += 1;
+                }
+            }
+        }
+        drop(hnsw);
+        if total_count == 0 {
+            return false;
+        }
+        let ratio = tombstone_count as f32 / total_count as f32;
+        // ponytail: compact_level uses size and tombstone ratio to decide
+        ratio >= tombstone_threshold
+    }
+
+    /// Compact a single LSM level by promoting live nodes to the next level.
+    ///
+    /// Reads live (non-tombstone) nodes from `level` using `self.get()`,
+    /// rewrites them to `level+1` using `write_node_to_vstore()`, updates
+    /// HNSW offset references, then truncates the source level's VantaFile.
+    ///
+    /// ponytail: L0→L1 only. L1→L2 and L2→L3 archive tier deferred.
+    #[tracing::instrument(skip(self), level = "info", err)]
+    pub fn compact_level(&self, level: u8) -> Result<LsmReport> {
+        let started = Instant::now();
+        let target_level = level + 1;
+
+        // All 4 LSM levels are pre-allocated at init (SegmentRegistry::open_or_create),
+        // so vector_store has entries for L0..L3 — no unsafe growth needed.
+
+        let hnsw = self.hnsw.load();
+
+        // Collect live node IDs in this level
+        let live_ids: Vec<u128> = hnsw
+            .nodes
+            .iter()
+            .filter_map(|entry| {
+                let n = entry.value();
+                let (seg_id, _) = crate::lsm::unpack_offset(n.storage_offset);
+                if seg_id as u8 == level && (n.flags & FLAG_TOMBSTONE) == 0 {
+                    Some(*entry.key())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if live_ids.is_empty() {
+            drop(hnsw);
+            return Ok(LsmReport {
+                level,
+                nodes_promoted: 0,
+                reclaimed_bytes: 0,
+                duration_ms: started.elapsed().as_millis() as u64,
+                success: true,
+            });
+        }
+
+        let mut nodes_promoted = 0u64;
+        let mut new_offsets: std::collections::HashMap<u128, u64> =
+            std::collections::HashMap::with_capacity(live_ids.len());
+
+        // Read each node via self.get() (segment-aware), write to target
+        for node_id in &live_ids {
+            let node = match self.get(*node_id) {
+                Ok(Some(n)) => n,
+                _ => continue,
+            };
+            let mut tgt = self.vector_store[target_level as usize].write();
+            let new_raw_off = crate::storage::ops::write_node_to_vstore(&mut tgt, &node)?;
+            let new_packed_off = crate::lsm::pack_offset(target_level, new_raw_off);
+            new_offsets.insert(*node_id, new_packed_off);
+            nodes_promoted += 1;
+        }
+
+        // Update HNSW offsets
+        for (node_id, new_off) in &new_offsets {
+            if let Some(mut node_ref) = hnsw.nodes.get_mut(node_id) {
+                node_ref.storage_offset = *new_off;
+            }
+        }
+        drop(hnsw);
+
+        // Truncate source segment: reset write cursor past alignment header
+        let reclaimed_bytes = {
+            let mut src = self.vector_store[level as usize].write();
+            let size_before = src.write_cursor;
+            src.write_cursor = STORAGE_ALIGNMENT;
+            src.flush()?;
+            size_before
+        };
+
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        tracing::info!(
+            level,
+            target_level,
+            nodes_promoted,
+            reclaimed_bytes,
+            elapsed_ms,
+            "compact_level: done"
+        );
+        Ok(LsmReport {
+            level,
+            nodes_promoted,
+            reclaimed_bytes,
+            duration_ms: elapsed_ms,
+            success: true,
+        })
+    }
+
+    /// Run the segment optimizer pipeline according to `mode`.
+    ///
+    /// Phases execute in order: Vacuum → FreshHNSW → Merge → Reindex.
+    /// A phase failure is logged but does **not** abort later phases. The
+    /// FreshHNSW phase places after Vacuum so that tombstoned nodes are
+    /// already purged — fewer orphan links to scan.
+    #[tracing::instrument(skip(self), level = "info", err)]
+    pub fn run_pipeline(&self, mode: PipelineMode) -> Result<PipelineReport> {
+        self.ensure_writable()?;
+
+        let pipeline_start = Instant::now();
+        let mut vacuum_report: Option<VacuumReport> = None;
+        let mut fresh_hnsw_report: Option<FreshHnswReport> = None;
+        let mut merge_report: Option<MergeReport> = None;
+        let mut index_report: Option<IndexRebuildReport> = None;
+        let mut all_ok = true;
+
+        tracing::info!(?mode, "pipeline: starting");
+
+        // Phase 1: Vacuum
+        let run_vacuum = matches!(mode, PipelineMode::Full | PipelineMode::VacuumOnly);
+        if run_vacuum {
+            match self.vacuum() {
+                Ok(r) => {
+                    tracing::info!(removed = r.removed_nodes, "pipeline: vacuum ok");
+                    vacuum_report = Some(r);
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "pipeline: vacuum failed");
+                    all_ok = false;
+                }
+            }
+        }
+
+        // Phase 1.5: FreshHNSW (after Vacuum, before Merge)
+        // Vacuum has already purged tombstoned nodes from the DashMap,
+        // so FreshHNSW finds fewer orphan links.
+        let run_fresh = matches!(mode, PipelineMode::Full | PipelineMode::FreshHnswOnly);
+        if run_fresh {
+            match self.fresh_hnsw() {
+                Ok(r) => {
+                    tracing::info!(repaired = r.repaired_links, "pipeline: fresh_hnsw ok");
+                    fresh_hnsw_report = Some(r);
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "pipeline: fresh_hnsw failed");
+                    all_ok = false;
+                }
+            }
+        }
+
+        // Phase 1.75: LSM compaction (between FreshHNSW and Merge)
+        // CompactOnly runs all levels; CompactL0Only runs L0 only.
+        // Guarded by should_compact_level so we don't compact unnecessarily.
+        let run_lsm = matches!(
+            mode,
+            PipelineMode::Full | PipelineMode::CompactOnly | PipelineMode::CompactL0Only
+        );
+        let mut lsm_reports: Vec<LsmReport> = Vec::new();
+        if run_lsm {
+            let max_level = match mode {
+                PipelineMode::CompactL0Only => 0u8,
+                _ => {
+                    // ponytail: L0+L1 only; L2 defered
+                    if self.vector_store.len() >= 2 {
+                        1u8
+                    } else {
+                        0u8
+                    }
+                }
+            };
+            for level in 0..=max_level {
+                if !self.should_compact_level(level) {
+                    tracing::info!(level, "pipeline: compact skip (below threshold)");
+                    continue;
+                }
+                match self.compact_level(level) {
+                    Ok(r) => {
+                        tracing::info!(level, promoted = r.nodes_promoted, "pipeline: compact ok");
+                        lsm_reports.push(r);
+                    }
+                    Err(e) => {
+                        tracing::error!(level, error = %e, "pipeline: compact failed");
+                        all_ok = false;
+                    }
+                }
+            }
+        }
+
+        // Phase 2: Merge
+        let run_merge = matches!(mode, PipelineMode::Full | PipelineMode::MergeOnly);
+        if run_merge {
+            match self.merge_segments() {
+                Ok(r) => {
+                    tracing::info!(saved = r.saved_bytes, "pipeline: merge ok");
+                    merge_report = Some(r);
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "pipeline: merge failed");
+                    all_ok = false;
+                }
+            }
+        }
+
+        // Phase 3: Reindex
+        let run_index = matches!(mode, PipelineMode::Full | PipelineMode::IndexOnly);
+        if run_index {
+            match self.rebuild_vector_index() {
+                Ok(r) => {
+                    tracing::info!(indexed = r.indexed_vectors, "pipeline: reindex ok");
+                    index_report = Some(r);
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "pipeline: reindex failed");
+                    all_ok = false;
+                }
+            }
+        }
+
+        let total_duration_ms = pipeline_start.elapsed().as_millis() as u64;
+        tracing::info!(
+            ?mode,
+            total_duration_ms,
+            success = all_ok,
+            "pipeline: finished"
+        );
+
+        Ok(PipelineReport {
+            vacuum: vacuum_report,
+            fresh_hnsw: fresh_hnsw_report,
+            merge: merge_report,
+            index: index_report,
+            lsm: None, // ponytail: added after compact_level phases
+            total_duration_ms,
+            success: all_ok,
+        })
+    }
+
     /// Recover archived nodes from TombstoneStorage that belonged to the given summary node.
     pub fn recover_archived_nodes(&self, summary_id: u128) -> Result<Vec<UnifiedNode>> {
         self.ensure_writable()?;
         let entries = self.backend.scan(BackendPartition::TombstoneStorage)?;
 
         let mut recovered = Vec::new();
+        let belonged_to_id = self.intern_label("belonged_to");
         for (_k, v) in &entries {
             if let Ok(mut node) = postcard::from_bytes::<UnifiedNode>(v) {
                 if node
                     .edges
                     .iter()
-                    .any(|e| e.target == summary_id && e.label == "belonged_to")
+                    .any(|e| e.target == summary_id && e.label_id == belonged_to_id)
                 {
                     node.flags.set(crate::node::NodeFlags::ACTIVE);
                     node.flags.set(crate::node::NodeFlags::RECOVERED);

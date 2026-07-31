@@ -1,6 +1,7 @@
 import { VantaDB as WasmVantaDB } from "vantadb-wasm";
 
 import { VantaError, wrapWasmError } from "./errors.js";
+import { isMemoryRecord } from "./guards.js";
 
 import type {
   Capabilities,
@@ -29,26 +30,13 @@ function _mapRecord(r: unknown): MemoryRecord {
       "_mapRecord: expected an object, got " + typeof r,
     );
   }
-  const obj = r as Record<string, unknown>;
-  if (typeof obj.namespace !== "string") {
+  if (!isMemoryRecord(r)) {
     throw new VantaError(
       "VALIDATION_ERROR",
-      "_mapRecord: record missing required string field 'namespace'",
+      "_mapRecord: invalid MemoryRecord structure or missing required fields",
     );
   }
-  if (typeof obj.key !== "string") {
-    throw new VantaError(
-      "VALIDATION_ERROR",
-      "_mapRecord: record missing required string field 'key'",
-    );
-  }
-  if (typeof obj.payload !== "string") {
-    throw new VantaError(
-      "VALIDATION_ERROR",
-      "_mapRecord: record missing required string field 'payload'",
-    );
-  }
-  return r as MemoryRecord;
+  return r;
 }
 
 export class VantaDB {
@@ -57,6 +45,15 @@ export class VantaDB {
 
   private constructor(inner: WasmVantaDB) {
     this.inner = inner;
+  }
+
+  /** Wraps a WASM call with a uniform error boundary. */
+  private _wasm<T>(method: string, fn: () => T): T {
+    try {
+      return fn();
+    } catch (e) {
+      throw wrapWasmError(e, method);
+    }
   }
 
   /**
@@ -85,6 +82,9 @@ export class VantaDB {
     }
   }
 
+  // NOTE: static factory methods (connect/create/open) cannot use _wasm() since
+  // the instance does not yet exist. They keep their own try-catch.
+
   /**
    * Create a new VantaDB instance with the given config.
    *
@@ -103,7 +103,7 @@ export class VantaDB {
   static create(config?: VantaConfig): VantaDB {
     if (config?.storage_path) {
       console.warn(
-        "VantaDB.create(): storage_path is ignored in WASM mode — the WASM backend always uses an in-memory engine.",
+        "VantaDB.create(): storage_path is ignored unless a persistent backend is connected via connect_persistent(), connect_idb(), or connect_worker().",
       );
     }
     try {
@@ -179,7 +179,7 @@ export class VantaDB {
    */
   capabilities(): Capabilities {
     this._assertOpen();
-    try {
+    return this._wasm("capabilities", () => {
       const raw = this.inner.capabilities();
       return {
         runtime_profile: raw.runtime_profile,
@@ -188,9 +188,7 @@ export class VantaDB {
         iql_queries: raw.iql_queries,
         read_only: raw.read_only,
       };
-    } catch (e) {
-      throw wrapWasmError(e, "capabilities");
-    }
+    });
   }
 
   /**
@@ -214,12 +212,7 @@ export class VantaDB {
    */
   put(input: MemoryInput): MemoryRecord {
     this._assertOpen();
-    try {
-      const raw = this.inner.put(input);
-      return _mapRecord(raw);
-    } catch (e) {
-      throw wrapWasmError(e, "put");
-    }
+    return this._wasm("put", () => _mapRecord(this.inner.put(input)));
   }
 
   /**
@@ -239,15 +232,13 @@ export class VantaDB {
    */
   putBatch(inputs: MemoryInput[]): MemoryRecord[] {
     this._assertOpen();
-    try {
+    return this._wasm("putBatch", () => {
       const records = this.inner.put_batch(inputs) as unknown[];
       for (let i = 0; i < records.length; i++) {
         records[i] = _mapRecord(records[i]);
       }
       return records as MemoryRecord[];
-    } catch (e) {
-      throw wrapWasmError(e, "putBatch");
-    }
+    });
   }
 
   /**
@@ -266,12 +257,10 @@ export class VantaDB {
    */
   get(namespace: string, key: string): MemoryRecord | null {
     this._assertOpen();
-    try {
+    return this._wasm("get", () => {
       const raw = this.inner.get(namespace, key);
       return raw != null ? _mapRecord(raw) : null;
-    } catch (e) {
-      throw wrapWasmError(e, "get");
-    }
+    });
   }
 
   /**
@@ -289,11 +278,7 @@ export class VantaDB {
    */
   delete(namespace: string, key: string): boolean {
     this._assertOpen();
-    try {
-      return this.inner.delete(namespace, key);
-    } catch (e) {
-      throw wrapWasmError(e, "delete");
-    }
+    return this._wasm("delete", () => this.inner.delete(namespace, key));
   }
 
   /**
@@ -309,11 +294,7 @@ export class VantaDB {
    */
   listNamespaces(): string[] {
     this._assertOpen();
-    try {
-      return this.inner.list_namespaces();
-    } catch (e) {
-      throw wrapWasmError(e, "listNamespaces");
-    }
+    return this._wasm("listNamespaces", () => this.inner.list_namespaces());
   }
 
   /**
@@ -336,7 +317,7 @@ export class VantaDB {
    */
   list(namespace: string, options: ListOptions = {}): MemoryListPage {
     this._assertOpen();
-    try {
+    return this._wasm("list", () => {
       const raw = this.inner.list(namespace, options);
       const items: unknown[] = raw.records ?? [];
       for (let i = 0; i < items.length; i++) {
@@ -346,9 +327,7 @@ export class VantaDB {
         records: items as MemoryRecord[],
         next_cursor: raw.next_cursor,
       };
-    } catch (e) {
-      throw wrapWasmError(e, "list");
-    }
+    });
   }
 
   private _buildSearchRequest(request: SearchRequest, explain?: boolean): Record<string, unknown> {
@@ -384,7 +363,7 @@ export class VantaDB {
    */
   search(request: SearchRequest): SearchHit[] {
     this._assertOpen();
-    try {
+    return this._wasm("search", () => {
       const raw = this.inner.search(this._buildSearchRequest(request)) as unknown[];
       return raw.map((hit: unknown) => {
         const h = hit as Record<string, unknown>;
@@ -394,9 +373,7 @@ export class VantaDB {
           explanation: (h.explanation ?? undefined) as SearchHit["explanation"],
         };
       });
-    } catch (e) {
-      throw wrapWasmError(e, "search");
-    }
+    });
   }
 
   /**
@@ -420,7 +397,7 @@ export class VantaDB {
     topK: number = 10,
   ): { node_id: string; distance: number }[] {
     this._assertOpen();
-    try {
+    return this._wasm("searchVector", () => {
       const raw: unknown[] = this.inner.search_vector(new Float32Array(vector), topK);
       return raw.map((hit: unknown) => {
         const h = hit as Record<string, unknown>;
@@ -429,9 +406,7 @@ export class VantaDB {
           distance: h.score as number,
         };
       });
-    } catch (e) {
-      throw wrapWasmError(e, "searchVector");
-    }
+    });
   }
 
   /**
@@ -453,13 +428,9 @@ export class VantaDB {
    */
   explainSearch(request: SearchRequest): Record<string, unknown> {
     this._assertOpen();
-    try {
-      return this.inner.explain_memory_search(
-        this._buildSearchRequest(request, true),
-      );
-    } catch (e) {
-      throw wrapWasmError(e, "explainSearch");
-    }
+    return this._wasm("explainSearch", () =>
+      this.inner.explain_memory_search(this._buildSearchRequest(request, true)),
+    );
   }
 
   /**
@@ -478,11 +449,7 @@ export class VantaDB {
    */
   exportNamespace(path: string, namespace: string): ExportReport {
     this._assertOpen();
-    try {
-      return this.inner.export_namespace(path, namespace);
-    } catch (e) {
-      throw wrapWasmError(e, "exportNamespace");
-    }
+    return this._wasm("exportNamespace", () => this.inner.export_namespace(path, namespace));
   }
 
   /**
@@ -499,11 +466,7 @@ export class VantaDB {
    */
   exportAll(path: string): ExportReport {
     this._assertOpen();
-    try {
-      return this.inner.export_all(path);
-    } catch (e) {
-      throw wrapWasmError(e, "exportAll");
-    }
+    return this._wasm("exportAll", () => this.inner.export_all(path));
   }
 
   /**
@@ -523,11 +486,7 @@ export class VantaDB {
    */
   importRecords(records: MemoryInput[]): ImportReport {
     this._assertOpen();
-    try {
-      return this.inner.import_records(records);
-    } catch (e) {
-      throw wrapWasmError(e, "importRecords");
-    }
+    return this._wasm("importRecords", () => this.inner.import_records(records));
   }
 
   /**
@@ -544,11 +503,7 @@ export class VantaDB {
    */
   importFile(path: string): ImportReport {
     this._assertOpen();
-    try {
-      return this.inner.import_file(path);
-    } catch (e) {
-      throw wrapWasmError(e, "importFile");
-    }
+    return this._wasm("importFile", () => this.inner.import_file(path));
   }
 
   /**
@@ -564,11 +519,32 @@ export class VantaDB {
    */
   rebuildIndex(): unknown {
     this._assertOpen();
-    try {
-      return this.inner.rebuild_index();
-    } catch (e) {
-      throw wrapWasmError(e, "rebuildIndex");
-    }
+    return this._wasm("rebuildIndex", () => this.inner.rebuild_index());
+  }
+
+  /**
+   * Rebuild the HNSW vector index from stored vectors with pagination.
+   *
+   * Paginates through memory records in batches (max 1000) using the
+   * cursor-based `list()` API to prevent OOM on large namespaces.
+   *
+   * @param namespace - The namespace to rebuild.
+   * @param pageSize - Batch size (default 1000, max 1000).
+   * @returns A rebuild report with scanned and indexed counts.
+   * @throws {VantaError} If the instance is closed.
+   *
+   * @example
+   * ```ts
+   * const report = db.reindexHnswFromText("docs");
+   * console.log(report.scanned_nodes, "nodes reindexed");
+   * ```
+   */
+  reindexHnswFromText(namespace: string, pageSize: number = 1000): unknown {
+    this._assertOpen();
+    // NOTE: reindex_hnsw_from_text is not yet exported by the installed WASM build.
+    // This method will work once the WASM package is rebuilt and published.
+    void namespace; void pageSize;
+    throw new VantaError("WASM_ERROR", "reindexHnswFromText: not available in the current WASM build");
   }
 
   /**
@@ -584,11 +560,7 @@ export class VantaDB {
    */
   compactLayout(): bigint {
     this._assertOpen();
-    try {
-      return this.inner.compact_layout();
-    } catch (e) {
-      throw wrapWasmError(e, "compactLayout");
-    }
+    return this._wasm("compactLayout", () => this.inner.compact_layout());
   }
 
   /**
@@ -600,11 +572,7 @@ export class VantaDB {
    */
   auditTextIndex(namespace?: string): unknown {
     this._assertOpen();
-    try {
-      return this.inner.audit_text_index(namespace ?? null);
-    } catch (e) {
-      throw wrapWasmError(e, "auditTextIndex");
-    }
+    return this._wasm("auditTextIndex", () => this.inner.audit_text_index(namespace ?? null));
   }
 
   /**
@@ -616,11 +584,7 @@ export class VantaDB {
    */
   auditTextIndexDeep(namespace?: string): unknown {
     this._assertOpen();
-    try {
-      return this.inner.audit_text_index_deep(namespace ?? null);
-    } catch (e) {
-      throw wrapWasmError(e, "auditTextIndexDeep");
-    }
+    return this._wasm("auditTextIndexDeep", () => this.inner.audit_text_index_deep(namespace ?? null));
   }
 
   /**
@@ -631,11 +595,7 @@ export class VantaDB {
    */
   repairTextIndex(): unknown {
     this._assertOpen();
-    try {
-      return this.inner.repair_text_index();
-    } catch (e) {
-      throw wrapWasmError(e, "repairTextIndex");
-    }
+    return this._wasm("repairTextIndex", () => this.inner.repair_text_index());
   }
 
   /**
@@ -650,11 +610,7 @@ export class VantaDB {
    */
   flush(): void {
     this._assertOpen();
-    try {
-      this.inner.flush();
-    } catch (e) {
-      throw wrapWasmError(e, "flush");
-    }
+    this._wasm("flush", () => this.inner.flush());
   }
 
   /**
@@ -669,11 +625,7 @@ export class VantaDB {
    */
   compactWal(): void {
     this._assertOpen();
-    try {
-      this.inner.compact_wal();
-    } catch (e) {
-      throw wrapWasmError(e, "compactWal");
-    }
+    this._wasm("compactWal", () => this.inner.compact_wal());
   }
 
   /**
@@ -689,11 +641,7 @@ export class VantaDB {
    */
   purgeExpired(): bigint {
     this._assertOpen();
-    try {
-      return this.inner.purge_expired();
-    } catch (e) {
-      throw wrapWasmError(e, "purgeExpired");
-    }
+    return this._wasm("purgeExpired", () => this.inner.purge_expired());
   }
 
   /**
@@ -710,11 +658,7 @@ export class VantaDB {
    */
   operationalMetrics(): OperationalMetrics {
     this._assertOpen();
-    try {
-      return this.inner.operational_metrics();
-    } catch (e) {
-      throw wrapWasmError(e, "operationalMetrics");
-    }
+    return this._wasm("operationalMetrics", () => this.inner.operational_metrics());
   }
 
   /**
@@ -732,11 +676,7 @@ export class VantaDB {
    */
   query(query: string): QueryResult {
     this._assertOpen();
-    try {
-      return this.inner.query(query);
-    } catch (e) {
-      throw wrapWasmError(e, "query");
-    }
+    return this._wasm("query", () => this.inner.query(query));
   }
 
   /**
@@ -769,16 +709,14 @@ export class VantaDB {
         `insertNode: id ${id} is not a safe integer — JavaScript numbers lose precision above 2^53. Use bigint for large IDs.`,
       );
     }
-    try {
+    this._wasm("insertNode", () =>
       this.inner.insert_node(
         BigInt(id),
         content ?? null,
         vector ? new Float32Array(vector) : null,
         fields,
-      );
-    } catch (e) {
-      throw wrapWasmError(e, "insertNode");
-    }
+      ),
+    );
   }
 
   /**
@@ -796,13 +734,11 @@ export class VantaDB {
    */
   getNode(id: number): NodeRecord | null {
     this._assertOpen();
-    try {
+    return this._wasm("getNode", () => {
       const raw = this.inner.get_node(BigInt(id));
       if (raw == null) return null;
       return raw as NodeRecord;
-    } catch (e) {
-      throw wrapWasmError(e, "getNode");
-    }
+    });
   }
 
   /**
@@ -819,11 +755,7 @@ export class VantaDB {
    */
   deleteNode(id: number, reason: string = "deleted"): void {
     this._assertOpen();
-    try {
-      this.inner.delete_node(BigInt(id), reason);
-    } catch (e) {
-      throw wrapWasmError(e, "deleteNode");
-    }
+    this._wasm("deleteNode", () => this.inner.delete_node(BigInt(id), reason));
   }
 
   /**
@@ -847,11 +779,9 @@ export class VantaDB {
     weight?: number,
   ): void {
     this._assertOpen();
-    try {
-      this.inner.add_edge(BigInt(source), BigInt(target), label, weight ?? null);
-    } catch (e) {
-      throw wrapWasmError(e, "addEdge");
-    }
+    this._wasm("addEdge", () =>
+      this.inner.add_edge(BigInt(source), BigInt(target), label, weight ?? null),
+    );
   }
 
   /**
@@ -870,14 +800,9 @@ export class VantaDB {
    */
   graphBfs(roots: number[], maxDepth: number = 10): GraphBfsResult {
     this._assertOpen();
-    try {
-      return this.inner.graph_bfs(
-        new BigUint64Array(roots.map(BigInt)),
-        maxDepth,
-      ) as GraphBfsResult;
-    } catch (e) {
-      throw wrapWasmError(e, "graphBfs");
-    }
+    return this._wasm("graphBfs", () =>
+      this.inner.graph_bfs(new BigUint64Array(roots.map(BigInt)), maxDepth) as GraphBfsResult,
+    );
   }
 
   /**
@@ -895,14 +820,9 @@ export class VantaDB {
    */
   graphDfs(roots: number[], maxDepth: number = 10): GraphDfsResult {
     this._assertOpen();
-    try {
-      return this.inner.graph_dfs(
-        new BigUint64Array(roots.map(BigInt)),
-        maxDepth,
-      ) as GraphDfsResult;
-    } catch (e) {
-      throw wrapWasmError(e, "graphDfs");
-    }
+    return this._wasm("graphDfs", () =>
+      this.inner.graph_dfs(new BigUint64Array(roots.map(BigInt)), maxDepth) as GraphDfsResult,
+    );
   }
 
   /**
@@ -920,13 +840,11 @@ export class VantaDB {
    */
   graphTopologicalSort(roots: number[]): GraphTopologicalSortResult {
     this._assertOpen();
-    try {
-      return this.inner.graph_topological_sort(
+    return this._wasm("graphTopologicalSort", () =>
+      this.inner.graph_topological_sort(
         new BigUint64Array(roots.map(BigInt)),
-      ) as GraphTopologicalSortResult;
-    } catch (e) {
-      throw wrapWasmError(e, "graphTopologicalSort");
-    }
+      ) as GraphTopologicalSortResult,
+    );
   }
 
   /**
@@ -943,11 +861,9 @@ export class VantaDB {
    */
   graphIsDag(roots: number[]): boolean {
     this._assertOpen();
-    try {
-      return this.inner.graph_is_dag(new BigUint64Array(roots.map(BigInt)));
-    } catch (e) {
-      throw wrapWasmError(e, "graphIsDag");
-    }
+    return this._wasm("graphIsDag", () =>
+      this.inner.graph_is_dag(new BigUint64Array(roots.map(BigInt))),
+    );
   }
 
   /**
@@ -974,11 +890,9 @@ export class VantaDB {
     withHighlighting: boolean = false,
   ): string | undefined {
     this._assertOpen();
-    try {
-      return this.inner.generate_snippet(payload, query, withHighlighting) ?? undefined;
-    } catch (e) {
-      throw wrapWasmError(e, "generateSnippet");
-    }
+    return this._wasm("generateSnippet", () =>
+      this.inner.generate_snippet(payload, query, withHighlighting) ?? undefined,
+    );
   }
 }
 

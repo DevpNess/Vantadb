@@ -3,6 +3,29 @@
 VantaDB Competitive Benchmark Suite (T3.2)
 Compares VantaDB, LanceDB, and ChromaDB on performance (Ingestion, Read Latency, QPS, Recall, RSS Memory).
 Supports glove-100-angular, sift-128-euclidean, and synthetic datasets.
+
+=== Measurement-methodology notes (read before comparing numbers) ===
+
+1. HIDDEN REBUILD — VantaDB's Ingest timer double-counts index building.
+   `db.put_batch_raw` is called once with ALL vectors (default `--size 10000`).
+   With InsertMode::Auto, the engine skips incremental HNSW insertion when the
+   batch is >= 1000 nodes (src/storage/engine/ops.rs:957-964) and performs ONE
+   full HNSW rebuild at the end of the batch — INSIDE the Ingest timer. The
+   explicit `db.rebuild_index()` in the Index timer then rebuilds AGAIN.
+   Net: 2 full index builds per run; the Ingest/Index deltas measure the same
+   build regression twice.
+   To isolate the hidden rebuild: run with `--batch-size 999`. Chunking the
+   Python-side insert to < 1000 nodes per `put_batch_raw` call forces
+   InsertMode::Incremental (no rebuild inside Ingest). The delta
+   `--batch-size 0` (single call) minus `--batch-size 999` IS the hidden
+   rebuild cost.
+
+2. PRE-REGRESSION BASELINE IS NOT DIRECTLY COMPARABLE.
+   The 3,157 QPS / 2,196 ms baseline (git diff 1235830e on this file:
+   +152/-29 lines) measured different work: no cosine normalization
+   (`np.linalg.norm`), no JIT ground-truth (compute_ground_truth), no warmup,
+   and no median-of-3 iterations. Any comparison against those numbers is
+   approximate only.
 """
 
 import argparse
@@ -10,6 +33,7 @@ import gc
 import json
 import os
 import shutil
+import statistics
 import time
 import urllib.request
 import sys
@@ -109,6 +133,13 @@ def load_dataset(dataset_name, dataset_dir, max_size, max_queries):
             
             metric = "cosine" if "glove" in dataset_name else "euclidean"
             
+            # Normalize vectors for cosine metric (ann-benchmarks HDF5 stores raw vectors)
+            if metric == "cosine":
+                train_norms = np.linalg.norm(train_vectors, axis=1, keepdims=True)
+                train_vectors = np.divide(train_vectors, train_norms, out=train_vectors, where=train_norms > 0)
+                test_norms = np.linalg.norm(test_vectors, axis=1, keepdims=True)
+                test_vectors = np.divide(test_vectors, test_norms, out=test_vectors, where=test_norms > 0)
+            
             # If we load a subset of vectors, we MUST compute exact ground truth because the HDF5 pre-computed
             # neighbors are based on the full 1M+ dataset, which might contain closest items that we didn't load.
             if n_train < len(train_all):
@@ -128,6 +159,7 @@ def load_dataset(dataset_name, dataset_dir, max_size, max_queries):
 def generate_synthetic_data(dim, size, queries, metric):
     """Generates normalized synthetic vectors and calculates exact ground truth."""
     print(f"Generating synthetic dataset ({size} vectors, {dim}d, metric={metric})...")
+    np.random.seed(42)  # D2: fixed seed for reproducibility
     # Ingest vectors
     train_vectors = np.random.uniform(-1.0, 1.0, (size, dim)).astype(np.float32)
     # Query vectors
@@ -178,7 +210,7 @@ def compute_ground_truth(train_vectors, test_vectors, metric, top_k=100):
 
 
 # 4. Engine Benchmark Functions
-def bench_vantadb(db_path, train_vectors, test_vectors, ground_truth, metric, top_k):
+def bench_vantadb(db_path, train_vectors, test_vectors, ground_truth, metric, top_k, batch_size=0):
     print("\nBenchmarking VantaDB...")
     if os.path.exists(db_path):
         shutil.rmtree(db_path)
@@ -193,15 +225,36 @@ def bench_vantadb(db_path, train_vectors, test_vectors, ground_truth, metric, to
     # The default distance metric on instantiation maps to cosine. Let's pass the parameter if supported
     # or rely on standard config.
     namespace = "bench"
-    for i, vec in enumerate(train_vectors):
-        db.put(
-            namespace=namespace,
-            key=f"doc-{i}",
-            payload=f"Payload metadata entry for vector number {i}",
-            metadata={"index": i},
-            vector=vec.tolist()
+    # PERF: batch insert via put_batch_raw with zero-copy numpy array (~50-300x vs per-vector put())
+    # batch_size > 0 chunks the insert so each put_batch_raw call is < 1000 nodes, forcing
+    # InsertMode::Incremental (no hidden HNSW rebuild inside this timer — see header comment).
+    n = len(train_vectors)
+    keys = [f"doc-{i}" for i in range(n)]
+    payloads = [f"Payload metadata entry for vector number {i}" for i in range(n)]
+    metadatas = [{"index": i} for i in range(n)]
+
+    def _put(vectors_chunk, keys_chunk, payloads_chunk, metadatas_chunk):
+        db.put_batch_raw(
+            vectors=vectors_chunk,  # numpy float32 ndarray (zero-copy via PyBuffer)
+            keys=keys_chunk,
+            payloads=payloads_chunk,
+            metadatas=metadatas_chunk,
+            namespaces=[namespace] * len(keys_chunk),
         )
-    
+
+    if batch_size and batch_size > 0:
+        for i in range(0, n, batch_size):
+            end = min(i + batch_size, n)
+            _put(
+                train_vectors[i:end],
+                keys[i:end],
+                payloads[i:end],
+                metadatas[i:end],
+            )
+    else:
+        # Default (--batch-size 0): single call, full array — the engine performs ONE full
+        # HNSW rebuild at the end of the batch, INSIDE this timer (see header comment).
+        _put(train_vectors, keys, payloads, metadatas)
     db.flush()
     ingest_time = time.perf_counter() - start_time
     rss_after_ingest = get_current_rss()
@@ -212,7 +265,17 @@ def bench_vantadb(db_path, train_vectors, test_vectors, ground_truth, metric, to
     index_time = time.perf_counter() - start_index
     rss_after_index = get_current_rss()
 
-    # 3. Queries
+    # 3. Warm-up: 10 queries (not measured) — D3
+    warmup_count = min(10, len(test_vectors))
+    for q in test_vectors[:warmup_count]:
+        db.search_memory(
+            namespace=namespace,
+            query_vector=q.tolist(),
+            top_k=top_k,
+            distance_metric=metric
+        )
+
+    # 4. Queries
     query_times = []
     predictions = []
     
@@ -227,12 +290,12 @@ def bench_vantadb(db_path, train_vectors, test_vectors, ground_truth, metric, to
         duration = (time.perf_counter() - t_start) * 1000.0 # ms
         query_times.append(duration)
         
-        # Parse result indices
+        # Parse result indices — VantaSearchHit has `.key` / `.id`
         pred_ids = []
         for item in results:
             try:
-                # Key is formatted as "doc-i"
-                idx = int(item['record']['key'].split('-')[1])
+                key = item.key if hasattr(item, 'key') else item.get('key', '')
+                idx = int(key.split('-')[1])
                 pred_ids.append(idx)
             except Exception:
                 pass
@@ -308,7 +371,12 @@ def bench_lancedb(db_path, train_vectors, test_vectors, ground_truth, metric, to
     index_time = time.perf_counter() - start_index
     rss_after_index = get_current_rss()
 
-    # 3. Queries
+    # 3. Warm-up: 10 queries (not measured) — D3
+    warmup_count = min(10, len(test_vectors))
+    for q in test_vectors[:warmup_count]:
+        tbl.search(q.tolist()).metric("cosine" if metric == "cosine" else "l2").nprobes(32).limit(top_k).to_list()
+
+    # 4. Queries
     query_times = []
     predictions = []
     
@@ -394,7 +462,15 @@ def bench_chromadb(db_path, train_vectors, test_vectors, ground_truth, metric, t
     index_time = 0.0 
     rss_after_index = get_current_rss()
 
-    # 3. Queries
+    # 3. Warm-up: 10 queries (not measured) — D3
+    warmup_count = min(10, len(test_vectors))
+    for q in test_vectors[:warmup_count]:
+        collection.query(
+            query_embeddings=[q.tolist()],
+            n_results=top_k
+        )
+
+    # 4. Queries
     query_times = []
     predictions = []
     
@@ -445,16 +521,84 @@ def bench_chromadb(db_path, train_vectors, test_vectors, ground_truth, metric, t
     }
 
 
-# 5. Main Execution Loop
+# 5. System Health Check (D1)
+def health_check(skip_prompt=False):
+    """Run system health checks before benchmark, optionally prompt user."""
+    print("\n" + "-" * 50)
+    print("System Health Check")
+    print("-" * 50)
+    ok = "  [OK]"
+    warn = "  [!]"
+
+    # Disk space
+    usage = psutil.disk_usage(".")
+    disk_free_pct = usage.free / usage.total * 100
+    if disk_free_pct > 15:
+        print(f"{ok} Disk space: {disk_free_pct:.1f}% free")
+    else:
+        print(f"{warn} Disk space: {disk_free_pct:.1f}% free (<15% WARNING)")
+
+    # RAM
+    ram = psutil.virtual_memory()
+    ram_free_gb = ram.available / (1024**3)
+    if ram_free_gb > 4:
+        print(f"{ok} RAM free: {ram_free_gb:.1f} GB")
+    else:
+        print(f"{warn} RAM free: {ram_free_gb:.1f} GB (<4 GB WARNING)")
+
+    # RAYON_NUM_THREADS
+    rayon_threads = os.environ.get("RAYON_NUM_THREADS")
+    if rayon_threads:
+        print(f"{ok} RAYON_NUM_THREADS={rayon_threads}")
+    else:
+        print(f"{warn} RAYON_NUM_THREADS not set (may over-subscribe)")
+
+    # CPU load (short sample)
+    cpu_load = psutil.cpu_percent(interval=0.5)
+    if cpu_load < 30:
+        print(f"{ok} CPU load: {cpu_load:.1f}%")
+    else:
+        print(f"{warn} CPU load: {cpu_load:.1f}% (>30% WARNING — benchmarks will be contaminated)")
+
+    # VS Code processes
+    vscode_count = 0
+    for proc in psutil.process_iter(["name"]):
+        try:
+            if proc.info["name"] and "code" in proc.info["name"].lower():
+                vscode_count += 1
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+    if vscode_count > 3:
+        print(f"{warn} VS Code processes: {vscode_count} (>3 WARNING)")
+    else:
+        print(f"{ok} VS Code processes: {vscode_count}")
+
+    print("-" * 50)
+    if skip_prompt or not sys.stdin.isatty():
+        return
+    response = input("Continue with benchmark? [Y/n]: ").strip().lower()
+    if response and response not in ("y", "yes", ""):
+        print("Benchmark cancelled by user.")
+        sys.exit(0)
+
+
+# 6. Main Execution Loop
 def main():
     parser = argparse.ArgumentParser(description="VantaDB Competitive Benchmark Suite")
     parser.add_argument("--dataset", type=str, default="synthetic", help="glove-100-angular, sift-128-euclidean, or synthetic")
     parser.add_argument("--size", type=int, default=10000, help="Number of database vectors to load/generate")
     parser.add_argument("--queries", type=int, default=100, help="Number of query vectors")
     parser.add_argument("--top-k", type=int, default=10, help="Top K neighbors to retrieve")
+    parser.add_argument("--batch-size", type=int, default=999,
+                        help="VantaDB ingest chunk size. 999 (default) = chunked incremental insert "
+                             "(no hidden HNSW rebuild inside the Ingest timer — rebuild measured "
+                             "only in Index timer). 0 = single put_batch_raw call (legacy; hidden "
+                             "rebuild runs inside Ingest AND Index timers = double rebuild). "
+                             "See header comment.")
     parser.add_argument("--dataset-dir", type=str, default="./datasets", help="Path to HDF5 dataset folder")
     parser.add_argument("--db-dir", type=str, default="./benchmarks/competitive_data", help="Temporal folder for databases")
     parser.add_argument("--output", type=str, default="docs/BENCHMARKS.md", help="Path to docs/BENCHMARKS.md to append results")
+    parser.add_argument("--yes", action="store_true", help="Skip health check prompt")
     args = parser.parse_args()
 
     print("=" * 60)
@@ -465,6 +609,9 @@ def main():
     print(f"Queries      : {args.queries}")
     print(f"Top-K        : {args.top_k}")
     print("=" * 60)
+
+    # D1: Health check before loading datasets
+    health_check(skip_prompt=args.yes)
 
     # Load vectors and ground truth
     train_vectors, test_vectors, ground_truth, metric = load_dataset(
@@ -477,29 +624,52 @@ def main():
 
     os.makedirs(args.db_dir, exist_ok=True)
 
-    results = []
-
-    # Run benchmarks with garbage collection in between
+    # D4: 3 iterations per engine, report median
     engines = [
-        ("vanta", bench_vantadb, os.path.join(args.db_dir, "vanta_db")),
-        ("lance", bench_lancedb, os.path.join(args.db_dir, "lance_db")),
-        ("chroma", bench_chromadb, os.path.join(args.db_dir, "chroma_db")),
+        ("vanta", bench_vantadb, os.path.join(args.db_dir, "vanta_db"), {"batch_size": args.batch_size}),
+        ("lance", bench_lancedb, os.path.join(args.db_dir, "lance_db"), {}),
+        ("chroma", bench_chromadb, os.path.join(args.db_dir, "chroma_db"), {}),
     ]
 
-    for name, bench_fn, path in engines:
-        gc.collect()
-        try:
-            res = bench_fn(path, train_vectors, test_vectors, ground_truth, metric, args.top_k)
-            results.append(res)
-        except Exception as e:
-            print(f"ERROR: Failed to benchmark {name}: {e}")
-            import traceback
-            traceback.print_exc()
+    all_engine_results = []  # (name, [run1_dict, run2_dict, run3_dict])
+
+    for name, bench_fn, path, kwargs in engines:
+        print(f"\n--- Running {name.capitalize()} (3 iterations) ---")
+        runs = []
+        for i in range(3):
+            gc.collect()
+            try:
+                res = bench_fn(path, train_vectors, test_vectors, ground_truth, metric, args.top_k, **kwargs)
+                runs.append(res)
+            except Exception as e:
+                print(f"  ERROR: Failed to benchmark {name} (run {i+1}): {e}")
+                import traceback
+                traceback.print_exc()
+        all_engine_results.append((name, runs))
+
+        if runs:
+            qps_values = [r["qps"] for r in runs]
+            qps_str = " | ".join(f"run {i+1}: {r['qps']:.1f} QPS" for i, r in enumerate(runs))
+            median_qps = statistics.median(qps_values)
+            print(f"  {name.capitalize()} {qps_str} | Median: {median_qps:.1f} QPS")
+
+    # Build median results for the final table
+    results = []
+    for name, runs in all_engine_results:
+        if not runs:
+            continue
+        median_res = {}
+        for key in runs[0]:
+            if key == "engine":
+                median_res[key] = runs[0][key]
+            else:
+                median_res[key] = statistics.median(r[key] for r in runs)
+        results.append(median_res)
 
     # Clear temp database folder
     shutil.rmtree(args.db_dir, ignore_errors=True)
 
-    # 6. Format and Print Results
+    # 7. Format and Print Results
     headers = ["Engine", "Ingest QPS", "Index Time (ms)", "Query QPS", "Latency p50 (ms)", "Latency p99 (ms)", "Recall@10", "Peak RSS (MB)", "Delta RSS (MB)"]
     rows = []
     for r in results:
@@ -522,6 +692,14 @@ def main():
     print("=" * 60)
     print(table_md)
     print("=" * 60)
+    if args.batch_size and args.batch_size > 0:
+        print(f"Ingest mode: chunked (--batch-size {args.batch_size}) — no hidden rebuild inside VantaDB Ingest timer.")
+    else:
+        print("Ingest mode: single put_batch_raw call (--batch-size 0) — VantaDB's full HNSW rebuild")
+        print("  runs INSIDE the Ingest timer AND again in Index timer (double rebuild).")
+        print("  Use default (--batch-size 999) for isolated measurements.")
+    print("\nNote: pre-Jul-31-2026 numbers used --batch-size 0 (double rebuild) and are NOT directly")
+    print("  comparable. See header comment for full methodology changelog.")
 
     # Write report back to docs/BENCHMARKS.md if specified
     if args.output and os.path.exists(args.output):

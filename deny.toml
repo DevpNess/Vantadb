@@ -2,15 +2,11 @@
 ignore = [
     # RUSTSEC-2023-0089: atomic-polyfill is unmaintained.
     # Transitive via postcard -> heapless (0.7.x) -> atomic-polyfill.
-    # Upstream: postcard 2.0 migrates to heapless 0.9+ which uses portable-atomic.
+    # Owner: vanta-lead
+    # Expiry: 2027-01-01
+    # Tracked: postcard 2.0 migrates to heapless 0.9+ which uses portable-atomic.
     # VantaDB already has portable-atomic as a direct dependency.
     "RUSTSEC-2023-0089",
-
-    # RUSTSEC-2024-0436: paste is unmaintained.
-    # Transitive via tikv-jemalloc-ctl -> paste (build-time proc macro, no runtime risk).
-    # Upstream: tikv-jemalloc-ctl 0.7 still depends on paste. No replacement needed.
-    "RUSTSEC-2024-0436",
-
 ]
 
 [licenses]

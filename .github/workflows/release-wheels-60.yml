@@ -166,6 +166,8 @@ jobs:
           path: ./dist
           merge-multiple: true
 
+      # CATEGORY: NON-CRITICAL — attest-build-provenance may fail if OIDC
+      # tokens are unavailable (e.g., fork PRs). Does not block wheel publishing.
       - name: Attest Build Provenance for Wheels
         continue-on-error: true
         uses: actions/attest-build-provenance@78e6cbd37d0ac1a40113c04f2037dacf1ea3f12e
@@ -198,7 +200,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
         with:
-          python-version: "3.11"
+          python-version: "3.13"
 
       - name: Extract version from tag or Cargo.toml
         id: pkg_version
@@ -247,7 +249,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
         with:
-          python-version: "3.11"
+          python-version: "3.13"
 
       - name: Extract version from tag
         id: pkg_version

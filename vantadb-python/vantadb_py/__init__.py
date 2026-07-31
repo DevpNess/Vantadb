@@ -134,8 +134,51 @@ class AsyncVantaDB:
     async def put_batch(self, entries):
         return await self._run(self._sync.put_batch, entries)
 
+    async def put_batch_raw(
+        self,
+        vectors,
+        keys,
+        *,
+        payloads=None,
+        metadatas=None,
+        namespaces=None,
+        ttls=None,
+    ):
+        """Insert multiple records using a 2D numpy array as vectors (zero-copy).
+
+        Args:
+            vectors: 2D numpy float32 array of shape ``[N, D]``, or any buffer-protocol object.
+            keys: List of N string keys.
+            payloads: Optional list of N string payloads.
+            metadatas: Optional list of N dicts or None.
+            namespaces: Optional list of N namespace strings (default "default").
+            ttls: Optional list of N optional TTL values in ms.
+
+        Returns a list of ``VantaMemoryRecord`` dicts in input order.
+        """
+        return await self._run(
+            self._sync.put_batch_raw,
+            vectors,
+            keys,
+            payloads,
+            metadatas,
+            namespaces,
+            ttls,
+        )
+
     async def rebuild_index(self):
         return await self._run(self._sync.rebuild_index)
+
+    async def bulk_import(self, path: str):
+        return await self._run(self._sync.bulk_import, path)
+
+    async def bulk_import_bytes(self, data: bytes):
+        return await self._run(self._sync.bulk_import_bytes, data)
+
+    async def reindex_hnsw_from_text(self, namespace: str, *, page_size: int = 1000):
+        return await self._run(
+            self._sync.reindex_hnsw_from_text, namespace, page_size
+        )
 
     async def export_namespace(self, path, namespace):
         return await self._run(
@@ -201,6 +244,20 @@ class AsyncVantaDB:
 
     async def graph_is_dag(self, roots):
         return await self._run(self._sync.graph_is_dag, roots)
+
+    async def graph_page_rank(
+        self, roots, max_iterations=100, damping=0.85, tolerance=1e-6
+    ):
+        return await self._run(
+            self._sync.graph_page_rank,
+            roots,
+            max_iterations,
+            damping,
+            tolerance,
+        )
+
+    async def graph_degree_centrality(self, roots):
+        return await self._run(self._sync.graph_degree_centrality, roots)
 
     async def compact_layout(self):
         return await self._run(self._sync.compact_layout)

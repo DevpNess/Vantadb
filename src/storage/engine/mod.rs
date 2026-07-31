@@ -26,8 +26,11 @@ use crate::backend::StorageBackend;
 use crate::config::VantaConfig;
 use crate::error::Result;
 use crate::index::CPIndex;
-use crate::node::{FilterBitset, UnifiedNode, VectorRepresentations};
-use crate::storage::vfile::{engine_mmap_resident_bytes, VantaFile};
+pub use crate::index::FreshHnswReport;
+use crate::lsm::pack_offset;
+pub(crate) use crate::lsm::SegmentRegistry;
+use crate::node::{FilterBitset, LabelIntern, UnifiedNode, VectorRepresentations};
+use crate::storage::vfile::VantaFile;
 
 // ─── Constants ──────────────────────────────────────────────────
 
@@ -40,6 +43,9 @@ pub(crate) const GIB: u64 = 1024 * 1024 * 1024;
 
 /// Selects which KV backend `StorageEngine` uses.
 pub use crate::backend::BackendKind;
+
+/// Options passed to [`StorageEngine::batch_insert_with_opts`](crate::storage::engine::ops::StorageEngine::batch_insert_with_opts).
+pub use self::ops::{BatchInsertOptions, InsertMode};
 
 /// Memory usage statistics for a `StorageEngine` instance.
 #[derive(Debug, Clone, Copy)]
@@ -116,6 +122,38 @@ pub struct QuantizationMaintenanceReport {
     pub promoted: u64,
 }
 
+/// An operation buffered inside an uncommitted transaction.
+/// Written to WAL + stores atomically at commit time.
+#[derive(Clone)]
+#[allow(clippy::large_enum_variant)] // UnifiedNode is hot-path; boxing adds indirection per insert
+pub(crate) enum BufferedWrite {
+    Insert(UnifiedNode),
+    Delete(u128),
+}
+
+/// A read snapshot capturing a consistent view of committed data.
+///
+/// Created via [`StorageEngine::begin_snapshot`]. All reads using this
+/// snapshot see only data committed at or before `txn_id`.
+#[derive(Debug, Clone, Copy)]
+pub struct Snapshot {
+    /// The transaction ID at which this snapshot was taken.
+    pub txn_id: u64,
+}
+
+/// A filesystem-level snapshot created via POSIX hard links (or copy on Windows).
+///
+/// Unlike the MVCC [`Snapshot`], this is a point-in-time copy of all data files
+/// in the storage directory — instant O(1) on Unix via hard links, O(n) on Windows
+/// via fallback copy.
+#[derive(Debug, Clone)]
+pub struct FsSnapshot {
+    /// Path to the snapshot directory.
+    pub path: PathBuf,
+    /// When the snapshot was created.
+    pub created_at: std::time::Instant,
+}
+
 /// A pending HNSW mutation awaiting batch flush.
 #[derive(Clone)]
 pub(crate) struct PendingHnswOp {
@@ -128,6 +166,120 @@ pub(crate) struct PendingHnswOp {
 
 /// Default batch size for HNSW micro-batching.
 pub(crate) const HNSW_BATCH_SIZE: usize = 64;
+
+/// Pipeline mode for the segment optimizer: chooses which maintenance
+/// operations to run in [`StorageEngine::run_pipeline`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PipelineMode {
+    /// Full pipeline: Vacuum → FreshHNSW → CompactL0 → CompactL1 → CompactL2 → Merge → Reindex.
+    #[default]
+    Full,
+    /// Only purge tombstones from the HNSW index.
+    VacuumOnly,
+    /// Only compact fragmented segments via layout BFS.
+    MergeOnly,
+    /// Only rebuild the HNSW vector index from scratch.
+    IndexOnly,
+    /// Only repair orphan links in the HNSW graph.
+    FreshHnswOnly,
+    /// Pipeline: Vacuum → Compact all levels → FreshHNSW → Merge → Reindex.
+    CompactOnly,
+    /// Pipeline: Vacuum → CompactL0 only → FreshHNSW → Merge → Reindex.
+    CompactL0Only,
+}
+
+/// Report from a single vacuum pass.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct VacuumReport {
+    /// Number of HNSW nodes scanned.
+    pub scanned_nodes: u64,
+    /// Number of tombstoned nodes removed from the HNSW index.
+    pub removed_nodes: u64,
+    /// Estimated bytes reclaimed by removing tombstoned nodes.
+    pub reclaimed_bytes: u64,
+    /// Duration of the vacuum pass in milliseconds.
+    pub duration_ms: u64,
+    /// Whether the pass completed successfully.
+    pub success: bool,
+}
+
+/// Report from a single merge (compaction) pass.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MergeReport {
+    /// Number of segments before compaction (always 1 for single VantaFile).
+    pub segments_before: u64,
+    /// Number of segments after compaction (always 1 for single VantaFile).
+    pub segments_after: u64,
+    /// Estimated bytes saved by compaction.
+    pub saved_bytes: u64,
+    /// Duration of the merge pass in milliseconds.
+    pub duration_ms: u64,
+    /// Whether the pass completed successfully.
+    pub success: bool,
+}
+
+/// Report from a single LSM level compaction pass.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LsmReport {
+    /// Which level was compacted (0 = L0, 1 = L1, 2 = L2).
+    pub level: u8,
+    /// Number of nodes promoted to the next level.
+    pub nodes_promoted: u64,
+    /// Bytes freed from the source level.
+    pub reclaimed_bytes: u64,
+    /// Duration of the compaction pass in milliseconds.
+    pub duration_ms: u64,
+    /// Whether the pass completed successfully.
+    pub success: bool,
+}
+
+/// Report from a complete [`PipelineMode`] run.
+#[derive(Debug, Clone, Default)]
+pub struct PipelineReport {
+    /// Vacuum report, if that phase was executed.
+    pub vacuum: Option<VacuumReport>,
+    /// Merge report, if that phase was executed.
+    pub merge: Option<MergeReport>,
+    /// LSM compaction reports, one per compacted level.
+    pub lsm: Option<Vec<LsmReport>>,
+    /// Index rebuild report, if that phase was executed.
+    pub index: Option<IndexRebuildReport>,
+    /// FreshHNSW report, if that phase was executed.
+    pub fresh_hnsw: Option<FreshHnswReport>,
+    /// Total wall-clock duration of the pipeline.
+    pub total_duration_ms: u64,
+    /// Whether all executed phases succeeded.
+    pub success: bool,
+}
+
+/// Configuration for the segment optimizer pipeline.
+///
+/// Controls automatic vacuum, merge, and reindex behaviour.
+#[derive(Debug, Clone, Copy)]
+pub struct SegmentOptimizerConfig {
+    /// Master switch for the optimizer (default: true).
+    pub enabled: bool,
+    /// Tombstone fraction (as a percentage) that triggers vacuum (default: 15.0).
+    pub vacuum_threshold_pct: f32,
+    /// How often to auto-run the pipeline in seconds (default: 3600).
+    pub auto_run_interval_secs: u64,
+    /// Maximum wall-clock duration for one pipeline run (default: 300).
+    pub max_pipeline_duration_secs: u64,
+    /// Per-level LSM tree compaction and sizing configuration.
+    pub lsm: crate::lsm::LsmConfig,
+}
+
+impl Default for SegmentOptimizerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            vacuum_threshold_pct: 15.0,
+            auto_run_interval_secs: 3600,
+            max_pipeline_duration_secs: 300,
+            lsm: crate::lsm::LsmConfig::default(),
+        }
+    }
+}
 
 /// Report returned by explicit ANN index rebuild operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -168,12 +320,24 @@ pub struct StorageEngine {
     pub last_query_timestamp: AtomicU64,
     /// Monotonic transaction ID counter (P3 Phase 1).
     pub(crate) next_txn_id: AtomicU64,
+    /// Active transaction IDs (concurrent: multiple active txns allowed).
+    /// Empty = no active transaction → insert/delete go direct.
+    /// Used for: snapshot visibility, write-write conflict detection.
+    pub(crate) active_txns: parking_lot::Mutex<std::collections::HashSet<u64>>,
+    /// Per-transaction write buffer. Keyed by txn_id.
+    /// Only the active txn's buffer is meaningful.
+    pub(crate) txn_buffers: parking_lot::Mutex<std::collections::HashMap<u64, Vec<BufferedWrite>>>,
     /// Flag signalling emergency maintenance (e.g. cache pressure).
     pub emergency_maintenance_trigger: AtomicBool,
     /// Path to the data directory.
     pub data_dir: PathBuf,
-    /// Vector store file for persistent node vector data.
-    pub vector_store: RwLock<VantaFile>,
+    /// Vector store files for persistent node vector data — one per LSM level.
+    /// Index 0 = L0 (hot), 1 = L1 (warm), 2 = L2 (cold).
+    /// All new writes go to index 0. Reads use unpack_offset() to select the correct file.
+    pub vector_store: Vec<RwLock<VantaFile>>,
+    /// Multi-level LSM segment registry tracking level metadata.
+    #[allow(dead_code)]
+    pub(crate) segment_registry: SegmentRegistry,
     /// Sharded write-ahead log for crash durability with reduced mutex contention.
     pub(crate) wal: Option<std::sync::Arc<crate::wal_sharded::ShardedWal>>,
     /// Memory governor for adaptive eviction
@@ -202,37 +366,162 @@ pub struct StorageEngine {
     /// Lightweight cardinality statistics for query optimization.
     pub(crate) cardinality_stats:
         RwLock<std::collections::HashMap<String, std::collections::HashMap<String, usize>>>,
+    /// Predictive cache warmer for co-access tracking and prefetch (OLD-20).
+    pub(crate) cache_warmer: crate::cache_warmer::CacheWarmer,
+    /// Bidirectional edge label interner: String ↔ u32.
+    /// Reduces per-edge label overhead from ~24-32 bytes to 4 bytes.
+    pub(crate) label_intern: parking_lot::Mutex<LabelIntern>,
 }
 
 // ─── Internal helpers used across sub-modules ──────────────────
 
 impl StorageEngine {
-    /// Write a node to the vector store and return its storage offset.
-    fn write_node_to_vstore(vstore: &mut VantaFile, node: &UnifiedNode) -> Result<u64> {
-        crate::storage::ops::write_node_to_vstore(vstore, node)
-    }
-
     /// Replay a single write operation during WAL recovery.
+    /// Writes to L0 (always) and packs the segment_id into the offset.
     fn replay_write_node(
-        vstore: &mut VantaFile,
+        vector_store: &[RwLock<VantaFile>],
         hnsw: &CPIndex,
         backend: &dyn StorageBackend,
         node_id: u128,
         node: &UnifiedNode,
     ) -> Result<()> {
         use crate::backend::BackendPartition;
+
         use crate::storage::ops::NodeMetadata;
-        let offset = crate::storage::ops::write_node_to_vstore(vstore, node)?;
-        hnsw.add(node_id, node.bitset.clone(), node.vector.clone(), offset);
+        let mut l0 = vector_store[0].write();
+        let local_off = crate::storage::ops::write_node_to_vstore(&mut l0, node)?;
+        let packed = pack_offset(0, local_off);
+        hnsw.add(node_id, node.bitset.clone(), node.vector.clone(), packed);
         let key = node.id.to_le_bytes();
         let metadata = NodeMetadata {
             relational: node.relational.clone(),
             edges: node.edges.clone(),
+            created_by_txn: 0, // recovery is pre-MVCC
+            deleted_by_txn: None,
         };
         let metadata_val =
             postcard::to_allocvec(&metadata).map_err(crate::error::VantaError::serialization)?;
         backend.put(BackendPartition::Default, &key, &metadata_val)?;
         Ok(())
+    }
+}
+
+// ─── Label Interning ───────────────────────────────────────
+
+impl StorageEngine {
+    /// Intern a label string, returning a stable u32 ID.
+    /// Creates a new entry if the label hasn't been seen before.
+    pub fn intern_label(&self, label: &str) -> u32 {
+        self.label_intern.lock().intern(label)
+    }
+
+    /// Resolve a label_id back to its string, if known.
+    pub fn resolve_label(&self, id: u32) -> Option<String> {
+        self.label_intern.lock().resolve(id).map(|s| s.to_string())
+    }
+
+    /// Convert a `UnifiedNode` to an SDK `VantaNodeRecord`, resolving edge labels.
+    pub fn node_to_record(&self, node: crate::node::UnifiedNode) -> crate::sdk::VantaNodeRecord {
+        crate::sdk::serialization::graph_types::unified_to_record(node, &self.label_intern.lock())
+    }
+}
+
+// ─── VecIndex accessor ─────────────────────────────────────
+
+impl StorageEngine {
+    /// Return a handle to the vector index (HNSW / IVF / flat) as a
+    /// [`VecIndex`](crate::index::VecIndex) trait object.
+    ///
+    /// The returned [`arc_swap::Guard`] auto-derefs to [`CPIndex`], which
+    /// implements [`VecIndex`](crate::index::VecIndex).  Callers invoke
+    /// trait methods (`.search()`, `.len()`, …) without binding to the
+    /// concrete index type.
+    pub fn vec_index(&self) -> arc_swap::Guard<Arc<CPIndex>> {
+        self.hnsw.load()
+    }
+}
+
+// ─── Filesystem Snapshots ──────────────────────────────────
+
+impl StorageEngine {
+    /// Create an instant filesystem snapshot by hard-linking all data files.
+    ///
+    /// On Unix, this is O(1) per file — the kernel creates directory entries
+    /// pointing at the same inode, so no data is copied. On Windows, falls
+    /// back to [`std::fs::copy`] (O(n) per file) since `CreateHardLinkA`
+    /// requires NTFS and may need admin rights.
+    #[cfg(unix)]
+    pub fn create_snapshot(&self, name: &str) -> crate::error::Result<FsSnapshot> {
+        let snap_dir = self.data_dir.join("snapshots").join(name);
+        std::fs::create_dir_all(&snap_dir)?;
+
+        #[cfg(feature = "failpoints")]
+        {
+            fail::fail_point!("snapshot_create_fail", |_| {
+                Err(crate::error::VantaError::IoError(std::io::Error::other(
+                    "Simulated snapshot create I/O failure",
+                )))
+            });
+        }
+
+        for entry in std::fs::read_dir(&self.data_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_file() {
+                let dest = snap_dir.join(entry.file_name());
+                std::fs::hard_link(&path, &dest)?;
+            }
+        }
+        Ok(FsSnapshot {
+            path: snap_dir,
+            created_at: std::time::Instant::now(),
+        })
+    }
+
+    /// Create a filesystem snapshot (Windows/WASM fallback using copy).
+    #[cfg(any(windows, target_arch = "wasm32"))]
+    pub fn create_snapshot(&self, name: &str) -> crate::error::Result<FsSnapshot> {
+        let snap_dir = self.data_dir.join("snapshots").join(name);
+        std::fs::create_dir_all(&snap_dir)?;
+
+        #[cfg(feature = "failpoints")]
+        {
+            fail::fail_point!("snapshot_create_fail", |_| {
+                Err(crate::error::VantaError::IoError(std::io::Error::other(
+                    "Simulated snapshot create I/O failure",
+                )))
+            });
+        }
+
+        for entry in std::fs::read_dir(&self.data_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_file() {
+                let dest = snap_dir.join(entry.file_name());
+                std::fs::copy(&path, &dest)?;
+            }
+        }
+        Ok(FsSnapshot {
+            path: snap_dir,
+            created_at: std::time::Instant::now(),
+        })
+    }
+
+    /// List existing snapshot names.
+    pub fn list_snapshots(&self) -> crate::error::Result<Vec<String>> {
+        let snap_dir = self.data_dir.join("snapshots");
+        if !snap_dir.exists() {
+            return Ok(Vec::new());
+        }
+        let mut names = Vec::new();
+        for entry in std::fs::read_dir(&snap_dir)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                names.push(entry.file_name().to_string_lossy().into_owned());
+            }
+        }
+        names.sort();
+        Ok(names)
     }
 }
 

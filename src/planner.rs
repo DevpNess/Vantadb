@@ -15,12 +15,22 @@
 
 use std::collections::BTreeMap;
 
+use crate::node::FieldValue;
+use crate::query::RelOp;
 use crate::sdk::{VantaHybridFusionReport, VantaMemorySearchHit, VantaMemorySearchRequest};
 
 // ── RRF constants ─────────────────────────────────────────────────────────
 
 /// Reciprocal Rank Fusion smoothing constant (standard literature value: 60).
 pub const RRF_K: f32 = 60.0;
+
+/// Selectivity threshold below which filters are considered highly selective.
+///
+/// When joint selectivity falls below this value, the optimizer prefers
+/// applying filters before vector search (scan→filter→refine) over the
+/// default vector-search→filter order. A filter with selectivity 0.1 means
+/// it prunes ~90 % of rows.
+pub const HIGH_SELECTIVITY_THRESHOLD: f32 = 0.1;
 
 /// Multiplier applied to `top_k` to derive the per-arm candidate budget.
 pub const CANDIDATE_MULTIPLIER: usize = 4;
@@ -178,25 +188,58 @@ pub fn sort_hits(hits: &mut [VantaMemorySearchHit]) {
 // ── Cost-Based Optimizer (CBO) & Volcano Compiler ─────────────────────────
 
 /// Optimise a logical plan and compile it into a physical operator.
+///
+/// Handles two plan shapes:
+/// 1. **Traditional** (FROM/MATCH): Scan → filters → vector → sort → project → limit
+/// 2. **SELECT/JOIN**: Join(recursive) | Scan → post-join filters → subquery → project
 pub fn optimize_and_compile<'a>(
     plan: &crate::query::LogicalPlan,
     storage: &'a crate::storage::StorageEngine,
 ) -> crate::error::Result<Box<dyn crate::query::PhysicalOperator + 'a>> {
+    // ---- First pass: collect metadata and detect plan shape ----
     let mut entity = "*".to_string();
-    for op in &plan.operators {
-        if let crate::query::LogicalOperator::Scan { entity: ent } = op {
-            entity = ent.clone();
-        }
-    }
-
     let mut relational_filters = Vec::new();
     let mut vector_search = None;
     let mut limit = None;
     let mut project = None;
     let mut sort = None;
 
+    // JOIN and SubqueryFilter produce their own sub-plans that wrap the chain
+    let mut has_join = false;
+    let mut join_spec: Option<(
+        crate::query::LogicalPlan,
+        crate::query::LogicalPlan,
+        String,
+        String,
+    )> = None;
+    let mut subquery_filters: Vec<(String, RelOp, crate::query::LogicalPlan)> = Vec::new();
+
     for op in &plan.operators {
         match op {
+            crate::query::LogicalOperator::Scan { entity: ent } => {
+                entity = ent.clone();
+            }
+            crate::query::LogicalOperator::Join {
+                left_plan,
+                right_plan,
+                left_field,
+                right_field,
+            } => {
+                has_join = true;
+                join_spec = Some((
+                    *left_plan.clone(),
+                    *right_plan.clone(),
+                    left_field.clone(),
+                    right_field.clone(),
+                ));
+            }
+            crate::query::LogicalOperator::SubqueryFilter {
+                field,
+                op,
+                subquery_plan,
+            } => {
+                subquery_filters.push((field.clone(), op.clone(), *subquery_plan.clone()));
+            }
             crate::query::LogicalOperator::FilterRelational {
                 field,
                 op: rel_op,
@@ -220,50 +263,100 @@ pub fn optimize_and_compile<'a>(
             crate::query::LogicalOperator::Sort { field, desc } => {
                 sort = Some((field.clone(), *desc));
             }
-            _ => {}
+            _ => {} // Traverse and other operators are handled by the executor cycle
         }
     }
 
+    // ---- CBO filter reordering and elimination ----
+    let mut with_sel: Vec<(f32, String, RelOp, FieldValue)> = relational_filters
+        .drain(..)
+        .map(|(f, op, v)| {
+            let sel = storage.get_estimated_selectivity(&f, &op, &v);
+            (sel, f, op, v)
+        })
+        .collect();
+    with_sel.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
     let mut joint_selectivity = 1.0f32;
-    for (field, rel_op, value) in &relational_filters {
-        let sel = storage.get_estimated_selectivity(field, rel_op, value);
+    let mut sorted_filters = Vec::with_capacity(with_sel.len());
+    for (sel, field, rel_op, value) in with_sel {
+        if sel >= 1.0 {
+            tracing::debug!("CBO: eliminated identity filter on {}", field);
+            continue;
+        }
         joint_selectivity *= sel;
+        sorted_filters.push((field, rel_op, value));
     }
 
-    let mut current_operator: Box<dyn crate::query::PhysicalOperator + 'a> =
-        if let Some((_field, query_text, min_score)) = vector_search {
-            if joint_selectivity < 0.1 && !relational_filters.is_empty() {
-                let mut scan_op: Box<dyn crate::query::PhysicalOperator + 'a> =
-                    Box::new(crate::physical_plan::PhysicalScan::new(storage, entity));
-                for (field, rel_op, value) in relational_filters {
-                    scan_op = Box::new(crate::physical_plan::PhysicalFilter::new(
-                        scan_op, field, rel_op, value,
-                    ));
-                }
-                Box::new(crate::physical_plan::PhysicalVectorRefine::new(
-                    scan_op, query_text, min_score,
-                ))
-            } else {
-                let mut vs_op: Box<dyn crate::query::PhysicalOperator + 'a> = Box::new(
-                    crate::physical_plan::PhysicalVectorSearch::new(storage, query_text, min_score),
-                );
-                for (field, rel_op, value) in relational_filters {
-                    vs_op = Box::new(crate::physical_plan::PhysicalFilter::new(
-                        vs_op, field, rel_op, value,
-                    ));
-                }
-                vs_op
-            }
-        } else {
+    // ---- Build the physical operator chain ----
+    // ponytail: predicate pushdown across joins not yet implemented.
+    // All WHERE filters apply post-join. Push filters into join children
+    // when alias is resolvable for better performance.
+
+    // Determine the base operator (scan or join) and apply sorted_filters
+    let mut current_operator: Box<dyn crate::query::PhysicalOperator + 'a> = if has_join {
+        let (left_plan, right_plan, left_field, right_field) = join_spec.unwrap();
+        let left_op = optimize_and_compile(&left_plan, storage)?;
+        let right_op = optimize_and_compile(&right_plan, storage)?;
+        let mut join_op: Box<dyn crate::query::PhysicalOperator + 'a> =
+            Box::new(crate::physical_plan::PhysicalNestedLoopJoin::new(
+                left_op,
+                right_op,
+                left_field,
+                right_field,
+            ));
+        // Apply post-join relational filters
+        for (field, rel_op, value) in sorted_filters {
+            join_op = Box::new(crate::physical_plan::PhysicalFilter::new(
+                join_op, field, rel_op, value,
+            ));
+        }
+        join_op
+    } else if let Some((_field, query_text, min_score)) = vector_search {
+        // CBO: filter-before-vector vs vector-before-filter
+        if joint_selectivity < HIGH_SELECTIVITY_THRESHOLD && !sorted_filters.is_empty() {
             let mut scan_op: Box<dyn crate::query::PhysicalOperator + 'a> =
                 Box::new(crate::physical_plan::PhysicalScan::new(storage, entity));
-            for (field, rel_op, value) in relational_filters {
+            for (field, rel_op, value) in sorted_filters {
                 scan_op = Box::new(crate::physical_plan::PhysicalFilter::new(
                     scan_op, field, rel_op, value,
                 ));
             }
-            scan_op
-        };
+            Box::new(crate::physical_plan::PhysicalVectorRefine::new(
+                scan_op, query_text, min_score,
+            ))
+        } else {
+            let mut vs_op: Box<dyn crate::query::PhysicalOperator + 'a> = Box::new(
+                crate::physical_plan::PhysicalVectorSearch::new(storage, query_text, min_score),
+            );
+            for (field, rel_op, value) in sorted_filters {
+                vs_op = Box::new(crate::physical_plan::PhysicalFilter::new(
+                    vs_op, field, rel_op, value,
+                ));
+            }
+            vs_op
+        }
+    } else {
+        let mut scan_op: Box<dyn crate::query::PhysicalOperator + 'a> =
+            Box::new(crate::physical_plan::PhysicalScan::new(storage, entity));
+        for (field, rel_op, value) in sorted_filters {
+            scan_op = Box::new(crate::physical_plan::PhysicalFilter::new(
+                scan_op, field, rel_op, value,
+            ));
+        }
+        scan_op
+    };
+
+    // Apply SubqueryFilter operators on top of the chain
+    for (field, op, subq_plan) in subquery_filters {
+        let subq_op = optimize_and_compile(&subq_plan, storage)?;
+        current_operator = Box::new(crate::physical_plan::PhysicalSubqueryFilter::new(
+            current_operator,
+            subq_op,
+            field,
+            op,
+        ));
+    }
 
     if let Some((field, desc)) = sort {
         current_operator = Box::new(crate::physical_plan::PhysicalSort::new(
@@ -418,5 +511,342 @@ mod tests {
         assert_eq!(SearchRoute::TextOnly.label(), "text-only");
         assert_eq!(SearchRoute::VectorOnly.label(), "vector-only");
         assert_eq!(SearchRoute::Empty.label(), "empty");
+    }
+
+    // ── trimmed_text_query ───────────────────────────────────────────────
+
+    #[test]
+    fn trimmed_text_query_none() {
+        let req = VantaMemorySearchRequest {
+            text_query: None,
+            ..Default::default()
+        };
+        assert_eq!(trimmed_text_query(&req), None);
+    }
+
+    #[test]
+    fn trimmed_text_query_empty() {
+        let req = VantaMemorySearchRequest {
+            text_query: Some(String::new()),
+            ..Default::default()
+        };
+        assert_eq!(trimmed_text_query(&req), None);
+    }
+
+    #[test]
+    fn trimmed_text_query_whitespace() {
+        let req = VantaMemorySearchRequest {
+            text_query: Some("   ".into()),
+            ..Default::default()
+        };
+        assert_eq!(trimmed_text_query(&req), None);
+    }
+
+    #[test]
+    fn trimmed_text_query_valid() {
+        let req = VantaMemorySearchRequest {
+            text_query: Some("hello world".into()),
+            ..Default::default()
+        };
+        assert_eq!(trimmed_text_query(&req), Some("hello world"));
+    }
+
+    #[test]
+    fn trimmed_text_query_trims_input() {
+        let req = VantaMemorySearchRequest {
+            text_query: Some("  query  ".into()),
+            ..Default::default()
+        };
+        assert_eq!(trimmed_text_query(&req), Some("query"));
+    }
+
+    // ── fuse_rrf_with_report ────────────────────────────────────────────
+
+    #[test]
+    fn fuse_rrf_with_report_counts() {
+        let lex = vec![make_hit("ns", "a", 0.9, 1)];
+        let vec = vec![make_hit("ns", "b", 0.8, 2)];
+        let (_hits, report) = fuse_rrf_with_report(lex.clone(), vec.clone());
+        assert_eq!(report.text_candidates, 1);
+        assert_eq!(report.vector_candidates, 1);
+        assert_eq!(report.rrf_k, RRF_K as usize);
+    }
+
+    #[test]
+    fn fuse_rrf_with_report_fused_results() {
+        let lex = vec![make_hit("ns", "a", 0.9, 1)];
+        let vec = vec![make_hit("ns", "a", 0.8, 1)];
+        let (hits, _report) = fuse_rrf_with_report(lex, vec);
+        assert_eq!(hits.len(), 1, "same key merged into one");
+        let expected = 2.0 / (RRF_K + 1.0);
+        assert!((hits[0].score - expected).abs() < 1e-6);
+    }
+
+    // ── sort_hits edge cases ────────────────────────────────────────────
+
+    #[test]
+    fn sort_hits_descending_order() {
+        let mut hits = vec![
+            make_hit("ns", "a", 0.3, 1),
+            make_hit("ns", "b", 0.9, 2),
+            make_hit("ns", "c", 0.5, 3),
+        ];
+        sort_hits(&mut hits);
+        assert_eq!(hits[0].record.key, "b", "highest score first");
+        assert_eq!(hits[1].record.key, "c", "middle score second");
+        assert_eq!(hits[2].record.key, "a", "lowest score last");
+    }
+
+    #[test]
+    fn sort_hits_ties_broken_by_key_then_node_id() {
+        let mut hits = vec![
+            make_hit("ns", "c", 0.5, 3),
+            make_hit("ns", "a", 0.5, 1),
+            make_hit("ns", "b", 0.5, 2),
+        ];
+        sort_hits(&mut hits);
+        assert_eq!(hits[0].record.key, "a", "ties broken alphabetically");
+        assert_eq!(hits[1].record.key, "b");
+        assert_eq!(hits[2].record.key, "c");
+    }
+
+    #[test]
+    fn sort_hits_ties_same_key_different_node_id() {
+        let mut hits = vec![make_hit("ns", "x", 0.5, 2), make_hit("ns", "x", 0.5, 1)];
+        sort_hits(&mut hits);
+        assert_eq!(hits[0].record.node_id, 1, "lower node_id first on tie");
+        assert_eq!(hits[1].record.node_id, 2);
+    }
+
+    #[test]
+    fn sort_hits_empty_list() {
+        let mut hits: Vec<VantaMemorySearchHit> = vec![];
+        sort_hits(&mut hits);
+        assert!(hits.is_empty());
+    }
+
+    // ── optimize_and_compile ─────────────────────────────────────────────
+
+    use crate::query::{LogicalOperator, LogicalPlan};
+
+    #[test]
+    fn optimize_and_compile_scan_only_produces_working_operator() {
+        use crate::config::VantaConfig;
+        use crate::storage::{BackendKind, StorageEngine};
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let config = VantaConfig {
+            backend_kind: BackendKind::InMemory,
+            ..Default::default()
+        };
+        let storage = StorageEngine::open_with_config(dir.path().to_str().unwrap(), Some(config))
+            .expect("Failed to open StorageEngine");
+
+        let plan = LogicalPlan {
+            operators: vec![LogicalOperator::Scan { entity: "*".into() }],
+            temperature: 0.0,
+            enforce_role: None,
+        };
+
+        let mut op = optimize_and_compile(&plan, &storage).unwrap();
+        op.open().unwrap();
+        assert!(op.next().unwrap().is_none(), "empty storage yields no rows");
+        op.close().unwrap();
+    }
+
+    #[test]
+    fn optimize_and_compile_scan_with_filter() {
+        use crate::config::VantaConfig;
+        use crate::node::{FieldValue, UnifiedNode};
+        use crate::query::RelOp;
+        use crate::storage::{BackendKind, StorageEngine};
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let config = VantaConfig {
+            backend_kind: BackendKind::InMemory,
+            ..Default::default()
+        };
+        let storage = StorageEngine::open_with_config(dir.path().to_str().unwrap(), Some(config))
+            .expect("Failed to open StorageEngine");
+
+        let mut node = UnifiedNode::new(1);
+        node.relational
+            .insert("type".into(), FieldValue::String("doc".into()));
+        storage.insert(&node).unwrap();
+
+        let plan = LogicalPlan {
+            operators: vec![
+                LogicalOperator::Scan { entity: "*".into() },
+                LogicalOperator::FilterRelational {
+                    field: "type".into(),
+                    op: RelOp::Eq,
+                    value: FieldValue::String("doc".into()),
+                },
+            ],
+            temperature: 0.0,
+            enforce_role: None,
+        };
+
+        let mut op = optimize_and_compile(&plan, &storage).unwrap();
+        op.open().unwrap();
+        let result = op.next().unwrap();
+        assert!(result.is_some(), "filter matching node should be returned");
+        assert_eq!(result.unwrap().id, 1);
+        assert!(op.next().unwrap().is_none(), "no more rows");
+        op.close().unwrap();
+    }
+
+    #[test]
+    fn optimize_and_compile_scan_filter_no_match() {
+        use crate::config::VantaConfig;
+        use crate::node::{FieldValue, UnifiedNode};
+        use crate::query::RelOp;
+        use crate::storage::{BackendKind, StorageEngine};
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let config = VantaConfig {
+            backend_kind: BackendKind::InMemory,
+            ..Default::default()
+        };
+        let storage = StorageEngine::open_with_config(dir.path().to_str().unwrap(), Some(config))
+            .expect("Failed to open StorageEngine");
+
+        let mut node = UnifiedNode::new(1);
+        node.relational
+            .insert("type".into(), FieldValue::String("doc".into()));
+        storage.insert(&node).unwrap();
+
+        let plan = LogicalPlan {
+            operators: vec![
+                LogicalOperator::Scan { entity: "*".into() },
+                LogicalOperator::FilterRelational {
+                    field: "type".into(),
+                    op: RelOp::Eq,
+                    value: FieldValue::String("note".into()),
+                },
+            ],
+            temperature: 0.0,
+            enforce_role: None,
+        };
+
+        let mut op = optimize_and_compile(&plan, &storage).unwrap();
+        op.open().unwrap();
+        assert!(
+            op.next().unwrap().is_none(),
+            "filter excludes the only node"
+        );
+        op.close().unwrap();
+    }
+
+    #[test]
+    fn optimize_and_compile_eliminates_identity_filter() {
+        // CBO Rule 2: a filter with selectivity ≈ 1.0 should be skipped.
+        // Insert one node; a filter on `type = doc` matches all rows
+        // (selectivity = 1/1 = 1.0) → the optimizer should eliminate it.
+        use crate::config::VantaConfig;
+        use crate::node::{FieldValue, UnifiedNode};
+        use crate::query::RelOp;
+        use crate::storage::{BackendKind, StorageEngine};
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let config = VantaConfig {
+            backend_kind: BackendKind::InMemory,
+            ..Default::default()
+        };
+        let storage = StorageEngine::open_with_config(dir.path().to_str().unwrap(), Some(config))
+            .expect("Failed to open StorageEngine");
+
+        let mut node = UnifiedNode::new(42);
+        node.relational
+            .insert("type".into(), FieldValue::String("doc".into()));
+        storage.insert(&node).unwrap();
+
+        // Plan: scan + filter on `type = doc` (identity — matches 100 % rows)
+        let plan = LogicalPlan {
+            operators: vec![
+                LogicalOperator::Scan { entity: "*".into() },
+                LogicalOperator::FilterRelational {
+                    field: "type".into(),
+                    op: RelOp::Eq,
+                    value: FieldValue::String("doc".into()),
+                },
+            ],
+            temperature: 0.0,
+            enforce_role: None,
+        };
+
+        let mut op = optimize_and_compile(&plan, &storage).unwrap();
+        op.open().unwrap();
+        let result = op.next().unwrap();
+        assert!(
+            result.is_some(),
+            "identity filter eliminated: node should still be returned"
+        );
+        assert_eq!(result.unwrap().id, 42);
+        // No more rows
+        assert!(op.next().unwrap().is_none());
+        op.close().unwrap();
+    }
+
+    #[test]
+    fn optimize_and_compile_with_sort_limit_project() {
+        use crate::config::VantaConfig;
+        use crate::node::{FieldValue, UnifiedNode};
+        use crate::storage::{BackendKind, StorageEngine};
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let config = VantaConfig {
+            backend_kind: BackendKind::InMemory,
+            ..Default::default()
+        };
+        let storage = StorageEngine::open_with_config(dir.path().to_str().unwrap(), Some(config))
+            .expect("Failed to open StorageEngine");
+
+        for i in 0..5 {
+            let mut node = UnifiedNode::new(i);
+            node.relational
+                .insert("val".into(), FieldValue::Int(i as i64));
+            node.relational
+                .insert("name".into(), FieldValue::String(format!("n_{}", i)));
+            storage.insert(&node).unwrap();
+        }
+
+        let plan = LogicalPlan {
+            operators: vec![
+                LogicalOperator::Scan { entity: "*".into() },
+                LogicalOperator::Sort {
+                    field: "val".into(),
+                    desc: true,
+                },
+                LogicalOperator::Project {
+                    fields: vec!["val".into()],
+                },
+                LogicalOperator::Limit { top_k: 3 },
+            ],
+            temperature: 0.0,
+            enforce_role: None,
+        };
+
+        let mut op = optimize_and_compile(&plan, &storage).unwrap();
+        op.open().unwrap();
+        let mut values = Vec::new();
+        while let Some(node) = op.next().unwrap() {
+            values.push(node.relational.get("val").cloned());
+            // Project should remove the "name" field
+            assert!(
+                !node.relational.contains_key("name"),
+                "project should remove non-projected fields"
+            );
+        }
+        assert_eq!(values.len(), 3, "limit caps to 3");
+        assert_eq!(values[0], Some(FieldValue::Int(4)), "highest first (desc)");
+        assert_eq!(values[1], Some(FieldValue::Int(3)));
+        assert_eq!(values[2], Some(FieldValue::Int(2)));
+        op.close().unwrap();
     }
 }

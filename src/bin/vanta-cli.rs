@@ -89,6 +89,51 @@ fn main() -> Result<()> {
             cli_handlers::cmd_delete(&args.db, &namespace, &key, args.verbose)?
         }
 
+        Commands::DeleteByFilter { namespace, filter } => {
+            cli_handlers::cmd_delete_by_filter(&args.db, &namespace, &filter, args.verbose)?
+        }
+
+        Commands::Count {
+            namespace,
+            filter,
+            json,
+        } => cli_handlers::cmd_count(&args.db, &namespace, filter.as_deref(), json, args.verbose)?,
+
+        Commands::SimilarToKey {
+            namespace,
+            key,
+            top_k,
+            json,
+        } => cli_handlers::cmd_similar_to_key(&args.db, &namespace, &key, top_k, json)?,
+
+        Commands::SearchMulti {
+            namespaces,
+            query,
+            query_vector,
+            top_k,
+            json,
+        } => cli_handlers::search::cmd_search_multi(
+            &args.db,
+            &namespaces,
+            query.as_deref(),
+            query_vector.as_deref(),
+            top_k,
+            json,
+        )?,
+
+        Commands::SearchAll {
+            query,
+            query_vector,
+            top_k,
+            json,
+        } => cli_handlers::search::cmd_search_all(
+            &args.db,
+            query.as_deref(),
+            query_vector.as_deref(),
+            top_k,
+            json,
+        )?,
+
         Commands::Namespace(cmd) => match cmd {
             vantadb::cli::NamespaceCommand::List => cli_handlers::cmd_namespace_list(&args.db)?,
             vantadb::cli::NamespaceCommand::Info { namespace } => {
@@ -113,6 +158,36 @@ fn main() -> Result<()> {
 
         Commands::Status => cli_handlers::cmd_status(&args.db, args.verbose)?,
 
+        Commands::Backup { out } => {
+            cli_handlers::cmd_backup(&args.db, out.as_deref(), args.verbose)?
+        }
+
+        Commands::Restore {
+            input,
+            force,
+            rebuild,
+        } => cli_handlers::cmd_restore(&args.db, &input, force, rebuild, args.verbose)?,
+
+        Commands::Doctor => cli_handlers::cmd_doctor(&args.db, args.verbose)?,
+
+        Commands::Inspect { namespace, key } => {
+            cli_handlers::cmd_inspect(&args.db, &namespace, &key, args.verbose)?
+        }
+
+        Commands::Stats { json } => cli_handlers::cmd_stats(&args.db, json, args.verbose)?,
+
+        Commands::Snapshot(cmd) => match cmd {
+            vantadb::cli::SnapshotCommand::Create { name } => {
+                cli_handlers::cmd_snapshot_create(&args.db, &name, args.verbose)?
+            }
+            vantadb::cli::SnapshotCommand::List => cli_handlers::cmd_snapshot_list(&args.db)?,
+        },
+
+        Commands::Wal(cmd) => match cmd {
+            vantadb::cli::WalCommand::Compact => cli_handlers::cmd_wal_compact(&args.db)?,
+            vantadb::cli::WalCommand::Vacuum => cli_handlers::cmd_wal_vacuum(&args.db)?,
+        },
+
         Commands::Completions { shell } => cli_handlers::cmd_completions(shell),
 
         Commands::Server {
@@ -122,6 +197,12 @@ fn main() -> Result<()> {
             host,
             require_auth,
         } => cli_handlers::cmd_server(&args.db, http, mcp, port, host, require_auth, args.verbose)?,
+
+        #[cfg(feature = "tui")]
+        Commands::Tui => {
+            let engine = std::sync::Arc::new(cli_handlers::open_database(&args.db, true)?);
+            vantadb::tui::run_tui(engine)?
+        }
     }
 
     Ok(())

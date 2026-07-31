@@ -12,6 +12,7 @@ release/
 *.rs.bk
 **/test_sdk*/
 **/docs/snapshots/
+docs/book/book/
 /snapshots/
 test_smoke/
 # Local database instances and logs
@@ -35,6 +36,7 @@ tests_server_db/
 job_log.txt
 
 # Python bindings and general Python artifacts
+*.abi3.so
 vantadb-python/target/
 .release-venv/
 *.py[cod]
@@ -125,6 +127,7 @@ job*_logs/
 *logs/
 *db/
 tests_*/
+test_*/
 
 # Local run artifacts and scratch scripts
 chaos_results.json
@@ -149,6 +152,11 @@ lcov.info
 # Backups
 *_BACKUP_*/
 
+# Fuzz lockfile — intentionally ignored.
+# Decision: fuzz/ is a secondary concern; lockfile churn adds PR noise.
+# Revisit if reproducible fuzz builds become a CI requirement.
+fuzz/Cargo.lock
+
 # Vector index binary
 vector_index.bin
 
@@ -165,21 +173,17 @@ Cargo_test.toml
 # OpenCode loop session artifacts
 .opencode/opencode-loop/
 
-# TanStack Router generated file — committed so CI builds are deterministic
-!web/src/routeTree.gen.ts
-
 # VS Code canvas files
 *.canvas
 
-# Test runner artifacts (Playwright, E2E)
-web/playwright-report/
-web/test-results/
-web/e2e/reports/
+# Test runner artifacts (Playwright, E2E — old Vite web archive)
+web_old/playwright-report/
+web_old/test-results/
+web_old/e2e/reports/
 
 # Visual review screenshots & reports
 screenshots/
 *.page-*.png
-web/scripts/eval-screenshots.mjs
 /architecture.png
 /engine.png
 /engine-mobile.png
@@ -205,3 +209,6 @@ traces/
 # Campaign executor budget state (auto-generated)
 .opencode/task-system/mcp/*.budget.json
 .github/workflows-dl/
+
+# Random build artifacts
+*.rar

@@ -13,6 +13,7 @@ use rand::SeedableRng;
 use crate::index::graph::{
     self, CPIndex, HnswNode, IndexBackend, NeighborVec, VECTOR_INDEX_VERSION,
 };
+use crate::index::ivf::IvfIndex;
 use crate::node::{DistanceMetric, FilterBitset, VectorRepresentations};
 
 impl CPIndex {
@@ -65,6 +66,14 @@ impl CPIndex {
             }
         }
 
+        // v8: index_type (version >= 8)
+        let index_type_byte: u8 = match self.config.index_type {
+            crate::index::IndexType::Ivf => 1,
+            _ => 0,
+        };
+        w.write_all(&[index_type_byte])?;
+        pos += 1;
+
         match self.get_entry_point() {
             Some(ep) => {
                 w.write_all(&[1])?;
@@ -82,6 +91,10 @@ impl CPIndex {
         let nc = node_count.to_le_bytes();
         w.write_all(&nc)?;
         pos += nc.len();
+
+        // Build lookup map once (O(N)) — not per-node.
+        let neighbor_map: std::collections::HashMap<u128, Vec<NeighborVec>> =
+            self.neighbor_index.collect_all().into_iter().collect();
 
         for node_id in self.serialization_order() {
             let Some(node) = self.nodes.get(&node_id) else {
@@ -182,19 +195,38 @@ impl CPIndex {
                 }
             }
 
-            let layer_count = node.neighbors.len() as u64;
-            let lc = layer_count.to_le_bytes();
-            w.write_all(&lc)?;
-            pos += lc.len();
-            for layer in &node.neighbors {
-                let neighbor_count = layer.len() as u64;
-                let nc = neighbor_count.to_le_bytes();
-                w.write_all(&nc)?;
-                pos += nc.len();
-                for &nid in layer {
-                    let nidb = nid.to_le_bytes();
-                    w.write_all(&nidb)?;
-                    pos += nidb.len();
+            if let Some(layers) = neighbor_map.get(&node.id) {
+                let layer_count = layers.len() as u64;
+                let lc = layer_count.to_le_bytes();
+                w.write_all(&lc)?;
+                pos += lc.len();
+                for layer in layers {
+                    let neighbor_count = layer.len() as u64;
+                    let nc = neighbor_count.to_le_bytes();
+                    w.write_all(&nc)?;
+                    pos += nc.len();
+                    for &nid in layer {
+                        let nidb = nid.to_le_bytes();
+                        w.write_all(&nidb)?;
+                        pos += nidb.len();
+                    }
+                }
+            }
+        }
+
+        // v8: optional IVF index data (version >= 8)
+        {
+            let guard = self.ivf_index.lock();
+            match guard.as_ref() {
+                Some(ivf) => {
+                    w.write_all(&[1])?;
+                    let ivf_bytes = ivf.serialize_to_bytes();
+                    let len = ivf_bytes.len() as u64;
+                    w.write_all(&len.to_le_bytes())?;
+                    w.write_all(&ivf_bytes)?;
+                }
+                None => {
+                    w.write_all(&[0])?;
                 }
             }
         }
@@ -281,7 +313,9 @@ impl CPIndex {
         };
         pos += crate::binary_header::VantaHeader::SIZE;
 
-        if let Err(e) = header.validate(*b"VNDX", VECTOR_INDEX_VERSION, "Index format mismatch") {
+        if let Err(e) =
+            header.validate_compat(*b"VNDX", VECTOR_INDEX_VERSION, "Index format mismatch")
+        {
             return Err(Error::new(ErrorKind::InvalidData, format!("{}", e)));
         }
 
@@ -313,6 +347,14 @@ impl CPIndex {
                 config.flat_threshold = None;
             }
         }
+        // v8: index_type
+        if version >= 8 && pos < data.len() {
+            let it_byte = take_bytes(data, &mut pos, 1, "index_type")?[0];
+            config.index_type = match it_byte {
+                1 => crate::index::IndexType::Ivf,
+                _ => crate::index::IndexType::Hnsw,
+            };
+        }
 
         let ep_exists = take_bytes(data, &mut pos, 1, "ep_exists")?[0];
         let ep_id = read_le_u128(data, &mut pos, "ep_id")?;
@@ -332,6 +374,8 @@ impl CPIndex {
         }
 
         let nodes: DashMap<u128, HnswNode> = DashMap::with_capacity(node_count);
+        let mut neighbors_data: std::collections::HashMap<u128, Vec<NeighborVec>> =
+            std::collections::HashMap::with_capacity(node_count);
 
         for _ in 0..node_count {
             let id = read_le_u128(data, &mut pos, "node id")?;
@@ -355,18 +399,13 @@ impl CPIndex {
                         pos += padding;
                     }
                     let vec_bytes = take_bytes(data, &mut pos, byte_len, "f32 vec")?;
-                    let mut v = Vec::with_capacity(vec_len);
-                    for i in 0..vec_len {
-                        let start = i * 4;
-                        v.push(f32::from_le_bytes(
-                            vec_bytes[start..start + 4].try_into().map_err(|e| {
-                                std::io::Error::new(
-                                    std::io::ErrorKind::InvalidData,
-                                    format!("f32 vec chunk at byte {start} expected 4 bytes: {e}"),
-                                )
-                            })?,
-                        ));
-                    }
+                    let v = match bytemuck::try_cast_slice::<u8, f32>(vec_bytes) {
+                        Ok(slice) => slice.to_vec(),
+                        Err(_) => vec_bytes
+                            .chunks_exact(4)
+                            .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+                            .collect(),
+                    };
                     VectorRepresentations::Full(v)
                 }
                 2 => {
@@ -415,7 +454,7 @@ impl CPIndex {
                 ));
             }
 
-            let mut neighbors = Vec::with_capacity(layer_count);
+            let mut layers = Vec::with_capacity(layer_count);
             for _ in 0..layer_count {
                 let neighbor_count = read_le_u64(data, &mut pos, "neighbor_count")? as usize;
 
@@ -435,35 +474,75 @@ impl CPIndex {
                         })?,
                     ));
                 }
-                neighbors.push(layer_neighbors);
+                layers.push(layer_neighbors);
             }
+            neighbors_data.insert(id, layers);
 
             let (inv_cached_norm, norm_sq) =
                 graph::cached_norms_for_metric(config.distance_metric, &vec_data);
+            // Pre-allocate inline neighbor_lists — populated after neighbor_index build.
+            let num_layers = neighbors_data.get(&id).map(|l| l.len()).unwrap_or(0);
+            let neighbor_lists = vec![NeighborVec::new(); num_layers];
             nodes.insert(
                 id,
                 HnswNode {
                     id,
                     bitset,
                     vec_data,
-                    neighbors,
                     storage_offset,
                     inv_cached_norm,
                     norm_sq,
                     flags: 0,
+                    neighbor_lists,
                 },
             );
+        }
+
+        // v8: deserialize optional IVF index data (version >= 8)
+        let ivf_index = if version >= 8 && pos < data.len() {
+            let ivf_present = take_bytes(data, &mut pos, 1, "ivf_present")?[0];
+            if ivf_present == 1 {
+                let ivf_len = read_le_u64(data, &mut pos, "ivf_len")? as usize;
+                let ivf_bytes = take_bytes(data, &mut pos, ivf_len, "ivf_data")?;
+                match IvfIndex::deserialize_from_bytes(ivf_bytes) {
+                    Some(ivf) => parking_lot::Mutex::new(Some(ivf)),
+                    None => {
+                        warn!("Failed to deserialize IVF index data, will rebuild on first search");
+                        parking_lot::Mutex::new(None)
+                    }
+                }
+            } else {
+                parking_lot::Mutex::new(None)
+            }
+        } else {
+            parking_lot::Mutex::new(None)
+        };
+
+        // Build neighbor_index from the deserialized neighbors data,
+        // and populate inline neighbor_lists in each node.
+        let neighbor_index = crate::index::neighbor_index::HnswNeighborIndex::new();
+        for (nid, layers) in &neighbors_data {
+            neighbor_index.allocate(*nid, layers.len());
+            for (layer_idx, layer_neighbors) in layers.iter().enumerate() {
+                neighbor_index.set_neighbors(*nid, layer_idx, layer_neighbors.clone());
+            }
+            // Populate inline neighbor cache (used by search_layer hot path).
+            if let Some(mut node_ref) = nodes.get_mut(nid) {
+                node_ref.neighbor_lists = layers.clone();
+            }
         }
 
         let node_count = nodes.len() as u64;
         Ok(Self {
             nodes,
+            neighbor_index,
             max_layer: AtomicUsize::new(max_layer),
             entry_point: AtomicU128::new(entry_point.unwrap_or(ENTRY_POINT_NONE)),
             backend: IndexBackend::InMemory,
             config,
             total_nodes: AtomicU64::new(node_count),
             rng: parking_lot::Mutex::new(rand::rngs::StdRng::seed_from_u64(42)),
+            ivf_index,
         })
     }
 
@@ -608,5 +687,862 @@ impl CPIndex {
 
         info!(path = %path.display(), node_count = self.nodes.len(), bytes = data.len(), "HNSW MMap synced & zero-copy pointers re-mapped via atomic rename");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+#[allow(missing_docs)]
+mod tests {
+    use super::*;
+    use crate::index::graph::{HnswConfig, ENTRY_POINT_NONE};
+    use crate::index::IndexBackend;
+    use crate::node::{DistanceMetric, FilterBitset, VectorRepresentations};
+    use portable_atomic::AtomicU128;
+    use std::sync::atomic::{AtomicU64, AtomicUsize};
+
+    /// Helper: build a small CPIndex with a single Full vector node.
+    fn single_full_node_index() -> CPIndex {
+        let nodes = dashmap::DashMap::new();
+        let neighbor_index = crate::index::neighbor_index::HnswNeighborIndex::new();
+        let id = 42u128;
+        nodes.insert(
+            id,
+            HnswNode {
+                id,
+                bitset: FilterBitset::new(),
+                vec_data: VectorRepresentations::Full(vec![0.1, 0.2, 0.3, 0.4]),
+                storage_offset: 0,
+                inv_cached_norm: 1.0,
+                norm_sq: 1.0,
+                flags: 0,
+                neighbor_lists: Vec::new(),
+            },
+        );
+        // Also insert the neighbor so validation passes
+        nodes.insert(
+            99u128,
+            HnswNode {
+                id: 99,
+                bitset: FilterBitset::new(),
+                vec_data: VectorRepresentations::Full(vec![0.5, 0.6, 0.7, 0.8]),
+                storage_offset: 0,
+                inv_cached_norm: 1.0,
+                norm_sq: 1.0,
+                flags: 0,
+                neighbor_lists: Vec::new(),
+            },
+        );
+        // Populate neighbor_index
+        neighbor_index.allocate(42, 1);
+        neighbor_index.set_neighbors(42, 0, smallvec::smallvec![99u128]);
+        neighbor_index.allocate(99, 1);
+        neighbor_index.set_neighbors(99, 0, smallvec::smallvec![42u128]);
+        CPIndex {
+            nodes,
+            neighbor_index,
+            max_layer: AtomicUsize::new(0),
+            entry_point: AtomicU128::new(42),
+            backend: IndexBackend::InMemory,
+            config: HnswConfig::default(),
+            total_nodes: AtomicU64::new(2),
+            rng: parking_lot::Mutex::new(rand::rngs::StdRng::seed_from_u64(42)),
+            ivf_index: parking_lot::Mutex::new(None),
+        }
+    }
+
+    // ── Round-trip: serialize → deserialize ──
+
+    #[test]
+    fn roundtrip_empty_index() {
+        let index = CPIndex::new();
+        let bytes = index.serialize_to_bytes();
+        assert!(bytes.len() >= 16, "header present");
+        let deser = CPIndex::deserialize_from_bytes(&bytes, true).unwrap();
+        assert_eq!(deser.nodes.len(), 0);
+        assert_eq!(deser.config.m, index.config.m);
+        assert_eq!(deser.config.distance_metric, index.config.distance_metric);
+        assert_eq!(
+            deser.max_layer.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+    }
+
+    #[test]
+    fn roundtrip_single_full_node() {
+        let index = single_full_node_index();
+        let bytes = index.serialize_to_bytes();
+        let deser = CPIndex::deserialize_from_bytes(&bytes, true).unwrap();
+        assert_eq!(deser.nodes.len(), 2);
+        let node = deser.nodes.get(&42).unwrap();
+        assert_eq!(node.id, 42);
+        match &node.vec_data {
+            VectorRepresentations::Full(v) => assert_eq!(v.as_slice(), &[0.1, 0.2, 0.3, 0.4]),
+            _ => panic!("expected Full"),
+        }
+        let neighbors42 = deser.neighbor_index.get_neighbors(42, 0).unwrap();
+        assert_eq!(neighbors42.as_slice(), &[99u128]);
+    }
+
+    #[test]
+    fn roundtrip_binary_vector() {
+        let nodes = dashmap::DashMap::new();
+        let neighbor_index = crate::index::neighbor_index::HnswNeighborIndex::new();
+        nodes.insert(
+            1u128,
+            HnswNode {
+                id: 1,
+                bitset: FilterBitset::new(),
+                vec_data: VectorRepresentations::Binary(vec![0xDEADBEEFCAFEu64].into_boxed_slice()),
+                storage_offset: 0,
+                inv_cached_norm: 0.0,
+                norm_sq: 0.0,
+                flags: 0,
+                neighbor_lists: Vec::new(),
+            },
+        );
+        neighbor_index.allocate(1, 1);
+        neighbor_index.set_neighbors(1, 0, smallvec::smallvec![]);
+        let index = CPIndex {
+            nodes,
+            neighbor_index,
+            max_layer: AtomicUsize::new(0),
+            entry_point: AtomicU128::new(ENTRY_POINT_NONE),
+            backend: IndexBackend::InMemory,
+            config: HnswConfig::default(),
+            total_nodes: AtomicU64::new(1),
+            rng: parking_lot::Mutex::new(rand::rngs::StdRng::seed_from_u64(42)),
+            ivf_index: parking_lot::Mutex::new(None),
+        };
+        let bytes = index.serialize_to_bytes();
+        let deser = CPIndex::deserialize_from_bytes(&bytes, true).unwrap();
+        let node = deser.nodes.get(&1).unwrap();
+        match &node.vec_data {
+            VectorRepresentations::Binary(b) => assert_eq!(b.as_ref(), &[0xDEADBEEFCAFEu64]),
+            _ => panic!("expected Binary"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_turbo_vector() {
+        let nodes = dashmap::DashMap::new();
+        let neighbor_index = crate::index::neighbor_index::HnswNeighborIndex::new();
+        nodes.insert(
+            1u128,
+            HnswNode {
+                id: 1,
+                bitset: FilterBitset::new(),
+                vec_data: VectorRepresentations::Turbo(vec![0xAB, 0xCD].into_boxed_slice()),
+                storage_offset: 0,
+                inv_cached_norm: 0.0,
+                norm_sq: 0.0,
+                flags: 0,
+                neighbor_lists: Vec::new(),
+            },
+        );
+        neighbor_index.allocate(1, 1);
+        neighbor_index.set_neighbors(1, 0, smallvec::smallvec![]);
+        let index = CPIndex {
+            nodes,
+            neighbor_index,
+            max_layer: AtomicUsize::new(0),
+            entry_point: AtomicU128::new(ENTRY_POINT_NONE),
+            backend: IndexBackend::InMemory,
+            config: HnswConfig::default(),
+            total_nodes: AtomicU64::new(1),
+            rng: parking_lot::Mutex::new(rand::rngs::StdRng::seed_from_u64(42)),
+            ivf_index: parking_lot::Mutex::new(None),
+        };
+        let bytes = index.serialize_to_bytes();
+        let deser = CPIndex::deserialize_from_bytes(&bytes, true).unwrap();
+        let node = deser.nodes.get(&1).unwrap();
+        match &node.vec_data {
+            VectorRepresentations::Turbo(t) => assert_eq!(t.as_ref(), &[0xAB, 0xCD]),
+            _ => panic!("expected Turbo"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_sq8_vector() {
+        let nodes = dashmap::DashMap::new();
+        let neighbor_index = crate::index::neighbor_index::HnswNeighborIndex::new();
+        nodes.insert(
+            1u128,
+            HnswNode {
+                id: 1,
+                bitset: FilterBitset::new(),
+                vec_data: VectorRepresentations::SQ8(
+                    vec![10i8, -20, 30, -40].into_boxed_slice(),
+                    2.5,
+                ),
+                storage_offset: 0,
+                inv_cached_norm: 0.0,
+                norm_sq: 0.0,
+                flags: 0,
+                neighbor_lists: Vec::new(),
+            },
+        );
+        neighbor_index.allocate(1, 1);
+        neighbor_index.set_neighbors(1, 0, smallvec::smallvec![]);
+        let index = CPIndex {
+            nodes,
+            neighbor_index,
+            max_layer: AtomicUsize::new(0),
+            entry_point: AtomicU128::new(ENTRY_POINT_NONE),
+            backend: IndexBackend::InMemory,
+            config: HnswConfig::default(),
+            total_nodes: AtomicU64::new(1),
+            rng: parking_lot::Mutex::new(rand::rngs::StdRng::seed_from_u64(42)),
+            ivf_index: parking_lot::Mutex::new(None),
+        };
+        let bytes = index.serialize_to_bytes();
+        let deser = CPIndex::deserialize_from_bytes(&bytes, true).unwrap();
+        let node = deser.nodes.get(&1).unwrap();
+        match &node.vec_data {
+            VectorRepresentations::SQ8(d, scale) => {
+                assert_eq!(d.as_ref(), &[10i8, -20, 30, -40]);
+                assert!((scale - 2.5).abs() < f32::EPSILON);
+            }
+            _ => panic!("expected SQ8"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_none_vector() {
+        let nodes = dashmap::DashMap::new();
+        let neighbor_index = crate::index::neighbor_index::HnswNeighborIndex::new();
+        nodes.insert(
+            1u128,
+            HnswNode {
+                id: 1,
+                bitset: FilterBitset::new(),
+                vec_data: VectorRepresentations::None,
+                storage_offset: 0,
+                inv_cached_norm: 0.0,
+                norm_sq: 0.0,
+                flags: 0,
+                neighbor_lists: Vec::new(),
+            },
+        );
+        neighbor_index.allocate(1, 1);
+        neighbor_index.set_neighbors(1, 0, smallvec::smallvec![]);
+        let index = CPIndex {
+            nodes,
+            neighbor_index,
+            max_layer: AtomicUsize::new(0),
+            entry_point: AtomicU128::new(ENTRY_POINT_NONE),
+            backend: IndexBackend::InMemory,
+            config: HnswConfig::default(),
+            total_nodes: AtomicU64::new(1),
+            rng: parking_lot::Mutex::new(rand::rngs::StdRng::seed_from_u64(42)),
+            ivf_index: parking_lot::Mutex::new(None),
+        };
+        let bytes = index.serialize_to_bytes();
+        let deser = CPIndex::deserialize_from_bytes(&bytes, true).unwrap();
+        let node = deser.nodes.get(&1).unwrap();
+        assert!(node.vec_data.is_none());
+    }
+
+    #[test]
+    fn roundtrip_multiple_nodes_with_neighbors() {
+        let neighbor_index = crate::index::neighbor_index::HnswNeighborIndex::new();
+        let mut index = CPIndex::new();
+        // Manually add 3 small fully-connected nodes
+        let ids = [10u128, 20, 30];
+        for &id in &ids {
+            index.nodes.insert(
+                id,
+                HnswNode {
+                    id,
+                    bitset: FilterBitset::all_set(),
+                    vec_data: VectorRepresentations::Full(vec![id as f32 / 100.0; 4]),
+                    storage_offset: id as u64,
+                    inv_cached_norm: 1.0,
+                    norm_sq: 0.5,
+                    flags: 0,
+                    neighbor_lists: Vec::new(),
+                },
+            );
+            neighbor_index.allocate(id, 1);
+            neighbor_index.set_neighbors(
+                id,
+                0,
+                smallvec::smallvec![
+                    ids[(ids.iter().position(|x| *x == id).unwrap() + 1) % 3],
+                    ids[(ids.iter().position(|x| *x == id).unwrap() + 2) % 3],
+                ],
+            );
+        }
+        index.neighbor_index = neighbor_index;
+        index.max_layer = AtomicUsize::new(0);
+        index.entry_point = AtomicU128::new(10);
+        index.total_nodes = AtomicU64::new(3);
+        index.config.ef_search = 200;
+
+        let bytes = index.serialize_to_bytes();
+        let deser = CPIndex::deserialize_from_bytes(&bytes, true).unwrap();
+        assert_eq!(deser.nodes.len(), 3);
+        assert_eq!(deser.config.ef_search, 200);
+
+        for &id in &ids {
+            let node = deser.nodes.get(&id).unwrap();
+            assert_eq!(node.storage_offset, id as u64);
+            let neighbors = deser.neighbor_index.get_neighbors(id, 0).unwrap();
+            assert_eq!(neighbors.len(), 2);
+        }
+    }
+
+    #[test]
+    fn roundtrip_with_bitset_filter() {
+        let mut bs = FilterBitset::new();
+        bs.set_bit(0);
+        bs.set_bit(2);
+        bs.set_bit(127);
+        let nodes = dashmap::DashMap::new();
+        let neighbor_index = crate::index::neighbor_index::HnswNeighborIndex::new();
+        nodes.insert(
+            1u128,
+            HnswNode {
+                id: 1,
+                bitset: bs.clone(),
+                vec_data: VectorRepresentations::Full(vec![1.0; 8]),
+                storage_offset: 100,
+                inv_cached_norm: 1.0,
+                norm_sq: 1.0,
+                flags: 0,
+                neighbor_lists: Vec::new(),
+            },
+        );
+        neighbor_index.allocate(1, 1);
+        neighbor_index.set_neighbors(1, 0, smallvec::smallvec![]);
+        let index = CPIndex {
+            nodes,
+            neighbor_index,
+            max_layer: AtomicUsize::new(0),
+            entry_point: AtomicU128::new(ENTRY_POINT_NONE),
+            backend: IndexBackend::InMemory,
+            config: HnswConfig::default(),
+            total_nodes: AtomicU64::new(1),
+            rng: parking_lot::Mutex::new(rand::rngs::StdRng::seed_from_u64(42)),
+            ivf_index: parking_lot::Mutex::new(None),
+        };
+        let data = index.serialize_to_bytes();
+        let deser = CPIndex::deserialize_from_bytes(&data, true).unwrap();
+        let node = deser.nodes.get(&1).unwrap();
+        assert!(node.bitset.has_bit(0));
+        assert!(!node.bitset.has_bit(1));
+        assert!(node.bitset.has_bit(2));
+        assert!(node.bitset.has_bit(127));
+    }
+
+    // ── Error handling ──
+
+    fn unwrap_io_err<T>(result: std::io::Result<T>) -> std::io::Error {
+        match result {
+            Err(e) => e,
+            Ok(_) => panic!("expected Err"),
+        }
+    }
+
+    #[test]
+    fn deserialize_truncated_header() {
+        let err = unwrap_io_err(CPIndex::deserialize_from_bytes(&[0u8; 10], true));
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn deserialize_wrong_magic() {
+        let index = CPIndex::new();
+        let mut bytes = index.serialize_to_bytes();
+        bytes[0..4].copy_from_slice(b"BAD!");
+        let err = unwrap_io_err(CPIndex::deserialize_from_bytes(&bytes, true));
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Index format") || msg.contains("magic"),
+            "wrong magic: {msg}"
+        );
+    }
+
+    #[test]
+    fn deserialize_wrong_version() {
+        let index = CPIndex::new();
+        let mut bytes = index.serialize_to_bytes();
+        bytes[4] = 0xFF;
+        bytes[5] = 0xFF;
+        let err = unwrap_io_err(CPIndex::deserialize_from_bytes(&bytes, true));
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn deserialize_node_count_exceeds_remaining() {
+        let index = CPIndex::new();
+        let mut bytes = index.serialize_to_bytes();
+        // Patch the last 8 bytes (node_count) to an absurdly high value
+        let sz = bytes.len();
+        let nc_offset = sz - 8;
+        bytes[nc_offset..].copy_from_slice(&u64::MAX.to_le_bytes());
+        let err = unwrap_io_err(CPIndex::deserialize_from_bytes(&bytes, true));
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn deserialize_truncated_in_middle() {
+        let index = single_full_node_index();
+        let bytes = index.serialize_to_bytes();
+        // Truncate past the "too small" guard (header + max_layer = 24) but before
+        // the node data — triggers UnexpectedEof from take_bytes.
+        let truncated = &bytes[..bytes.len() - 10];
+        let err = unwrap_io_err(CPIndex::deserialize_from_bytes(truncated, true));
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn serialize_mmapfull_none_fails() {
+        let nodes = dashmap::DashMap::new();
+        let neighbor_index = crate::index::neighbor_index::HnswNeighborIndex::new();
+        nodes.insert(
+            1u128,
+            HnswNode {
+                id: 1,
+                bitset: FilterBitset::new(),
+                vec_data: VectorRepresentations::MmapFull(None),
+                storage_offset: 0,
+                inv_cached_norm: 0.0,
+                norm_sq: 0.0,
+                flags: 0,
+                neighbor_lists: Vec::new(),
+            },
+        );
+        neighbor_index.allocate(1, 1);
+        neighbor_index.set_neighbors(1, 0, smallvec::smallvec![]);
+        let index = CPIndex {
+            nodes,
+            neighbor_index,
+            max_layer: AtomicUsize::new(0),
+            entry_point: AtomicU128::new(ENTRY_POINT_NONE),
+            backend: IndexBackend::InMemory,
+            config: HnswConfig::default(),
+            total_nodes: AtomicU64::new(1),
+            rng: parking_lot::Mutex::new(rand::rngs::StdRng::seed_from_u64(42)),
+            ivf_index: parking_lot::Mutex::new(None),
+        };
+        let err = index
+            .serialize_to_writer(&mut std::io::Cursor::new(Vec::new()))
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    // ── Persist / load round-trip ──
+
+    #[test]
+    fn persist_and_load_roundtrip() {
+        let index = single_full_node_index();
+        let dir = std::env::temp_dir().join(format!("vantadb_ser_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("index.bin");
+
+        index.persist_to_file(&path).unwrap();
+        assert!(path.exists(), "file must exist");
+
+        let loaded = match CPIndex::load_from_file(&path, false) {
+            Some(index) => index,
+            None => panic!("load should succeed"),
+        };
+        assert_eq!(loaded.nodes.len(), 2);
+        let node = loaded.nodes.get(&42).unwrap();
+        match &node.vec_data {
+            VectorRepresentations::Full(v) => assert_eq!(v.as_slice(), &[0.1, 0.2, 0.3, 0.4]),
+            _ => panic!("expected Full"),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_nonexistent_file_returns_none() {
+        let path = std::env::temp_dir().join("vantadb__nonexistent__index.bin");
+        let result = CPIndex::load_from_file(&path, false);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn euclidean_metric_roundtrip() {
+        let neighbor_index = crate::index::neighbor_index::HnswNeighborIndex::new();
+        let mut index = CPIndex::new_with_config(HnswConfig {
+            distance_metric: DistanceMetric::Euclidean,
+            ..Default::default()
+        });
+        index.nodes.insert(
+            1u128,
+            HnswNode {
+                id: 1,
+                bitset: FilterBitset::new(),
+                vec_data: VectorRepresentations::Full(vec![0.5; 4]),
+                storage_offset: 0,
+                inv_cached_norm: 1.0,
+                norm_sq: 0.25,
+                flags: 0,
+                neighbor_lists: Vec::new(),
+            },
+        );
+        neighbor_index.allocate(1, 1);
+        neighbor_index.set_neighbors(1, 0, smallvec::smallvec![]);
+        index.neighbor_index = neighbor_index;
+        index.entry_point = AtomicU128::new(ENTRY_POINT_NONE);
+        index.total_nodes = AtomicU64::new(1);
+
+        let data = index.serialize_to_bytes();
+        let deser = CPIndex::deserialize_from_bytes(&data, true).unwrap();
+        assert_eq!(deser.config.distance_metric, DistanceMetric::Euclidean);
+    }
+
+    #[test]
+    fn flat_threshold_roundtrip() {
+        let config = HnswConfig {
+            flat_threshold: Some(5000),
+            ..Default::default()
+        };
+        let index = CPIndex::new_with_config(config);
+        let data = index.serialize_to_bytes();
+        let deser = CPIndex::deserialize_from_bytes(&data, true).unwrap();
+        assert_eq!(deser.config.flat_threshold, Some(5000));
+
+        // None roundtrip
+        let config2 = HnswConfig {
+            flat_threshold: None,
+            ..Default::default()
+        };
+        let index2 = CPIndex::new_with_config(config2);
+        let data2 = index2.serialize_to_bytes();
+        let deser2 = CPIndex::deserialize_from_bytes(&data2, true).unwrap();
+        assert_eq!(deser2.config.flat_threshold, None);
+    }
+
+    #[test]
+    fn load_corrupt_file_returns_none() {
+        let dir =
+            std::env::temp_dir().join(format!("vantadb_ser_test_corrupt_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("corrupt.bin");
+        std::fs::write(&path, [0u8; 32]).unwrap();
+        let result = CPIndex::load_from_file(&path, false);
+        assert!(result.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[ignore = "timestamps differ between serialize_to_bytes (calls writer internally) and direct serialize_to_writer call -- VantaHeader::new() uses SystemTime::now()"]
+    fn to_bytes_matches_writer() {
+        let index = single_full_node_index();
+        let bytes = index.serialize_to_bytes();
+        let mut buf = Vec::new();
+        index.serialize_to_writer(&mut buf).unwrap();
+        assert_eq!(bytes, buf);
+    }
+
+    #[test]
+    fn config_preserved_after_roundtrip() {
+        let config = HnswConfig {
+            m: 16,
+            m_max0: 32,
+            ef_construction: 200,
+            ef_search: 50,
+            ml: 0.5,
+            ..Default::default()
+        };
+        let index = CPIndex::new_with_config(config.clone());
+        let data = index.serialize_to_bytes();
+        let deser = CPIndex::deserialize_from_bytes(&data, true).unwrap();
+        assert_eq!(deser.config.m, config.m);
+        assert_eq!(deser.config.m_max0, config.m_max0);
+        assert_eq!(deser.config.ef_construction, config.ef_construction);
+        assert_eq!(deser.config.ef_search, config.ef_search);
+        assert!((deser.config.ml - config.ml).abs() < f64::EPSILON);
+    }
+
+    // ── Miri tests for serialize/deserialize paths ──────────────────────
+    //
+    // The unsafe blocks in serialize.rs are in `load_from_file` and
+    // `sync_to_mmap` (MmapMut::map_mut) and the MmapFull serialize path
+    // (from_raw_parts). Miri cannot execute actual file I/O (MIRI_NO_HOST_FALLBACK=1),
+    // so these tests cover the safe serialize/deserialize paths. The unsafe
+    // patterns in distance.rs (chunks_exact + unwrap_unchecked) that are
+    // exercised through HNSW operations are tested via graph.rs Miri tests.
+
+    #[cfg(miri)]
+    #[test]
+    #[ignore] // croaring (C FFI) can't run under Miri
+    fn miri_serialize_roundtrip_empty() {
+        let index = CPIndex::new();
+        let bytes = index.serialize_to_bytes();
+        let deser = CPIndex::deserialize_from_bytes(&bytes, true).unwrap();
+        assert_eq!(deser.nodes.len(), 0);
+    }
+
+    #[cfg(miri)]
+    #[test]
+    #[ignore] // croaring (C FFI) can't run under Miri
+    fn miri_serialize_roundtrip_full_vector() {
+        let index = single_full_node_index();
+        let bytes = index.serialize_to_bytes();
+        let deser = CPIndex::deserialize_from_bytes(&bytes, true).unwrap();
+        assert_eq!(deser.nodes.len(), 2);
+        let node = deser.nodes.get(&42).unwrap();
+        match &node.vec_data {
+            VectorRepresentations::Full(v) => assert_eq!(v.as_slice(), &[0.1, 0.2, 0.3, 0.4]),
+            _ => panic!("expected Full"),
+        }
+    }
+
+    #[cfg(miri)]
+    #[test]
+    #[ignore] // croaring (C FFI) can't run under Miri
+    fn miri_serialize_roundtrip_binary() {
+        let nodes = dashmap::DashMap::new();
+        let neighbor_index = crate::index::neighbor_index::HnswNeighborIndex::new();
+        nodes.insert(
+            1u128,
+            HnswNode {
+                id: 1,
+                bitset: FilterBitset::new(),
+                vec_data: VectorRepresentations::Binary(vec![0xDEADBEEFCAFEu64].into_boxed_slice()),
+                storage_offset: 0,
+                inv_cached_norm: 0.0,
+                norm_sq: 0.0,
+                flags: 0,
+                neighbor_lists: Vec::new(),
+            },
+        );
+        neighbor_index.allocate(1, 1);
+        neighbor_index.set_neighbors(1, 0, smallvec::smallvec![]);
+        let index = CPIndex {
+            nodes,
+            neighbor_index,
+            max_layer: AtomicUsize::new(0),
+            entry_point: AtomicU128::new(ENTRY_POINT_NONE),
+            backend: IndexBackend::InMemory,
+            config: HnswConfig::default(),
+            total_nodes: AtomicU64::new(1),
+            rng: parking_lot::Mutex::new(rand::rngs::StdRng::seed_from_u64(42)),
+            ivf_index: parking_lot::Mutex::new(None),
+        };
+        let bytes = index.serialize_to_bytes();
+        let deser = CPIndex::deserialize_from_bytes(&bytes, true).unwrap();
+        let node = deser.nodes.get(&1).unwrap();
+        match &node.vec_data {
+            VectorRepresentations::Binary(b) => assert_eq!(b.as_ref(), &[0xDEADBEEFCAFEu64]),
+            _ => panic!("expected Binary"),
+        }
+    }
+
+    #[cfg(miri)]
+    #[test]
+    #[ignore] // croaring (C FFI) can't run under Miri
+    fn miri_serialize_roundtrip_turbo() {
+        let nodes = dashmap::DashMap::new();
+        let neighbor_index = crate::index::neighbor_index::HnswNeighborIndex::new();
+        nodes.insert(
+            1u128,
+            HnswNode {
+                id: 1,
+                bitset: FilterBitset::new(),
+                vec_data: VectorRepresentations::Turbo(vec![0xAB, 0xCD].into_boxed_slice()),
+                storage_offset: 0,
+                inv_cached_norm: 0.0,
+                norm_sq: 0.0,
+                flags: 0,
+                neighbor_lists: Vec::new(),
+            },
+        );
+        neighbor_index.allocate(1, 1);
+        neighbor_index.set_neighbors(1, 0, smallvec::smallvec![]);
+        let index = CPIndex {
+            nodes,
+            neighbor_index,
+            max_layer: AtomicUsize::new(0),
+            entry_point: AtomicU128::new(ENTRY_POINT_NONE),
+            backend: IndexBackend::InMemory,
+            config: HnswConfig::default(),
+            total_nodes: AtomicU64::new(1),
+            rng: parking_lot::Mutex::new(rand::rngs::StdRng::seed_from_u64(42)),
+            ivf_index: parking_lot::Mutex::new(None),
+        };
+        let bytes = index.serialize_to_bytes();
+        let deser = CPIndex::deserialize_from_bytes(&bytes, true).unwrap();
+        let node = deser.nodes.get(&1).unwrap();
+        match &node.vec_data {
+            VectorRepresentations::Turbo(t) => assert_eq!(t.as_ref(), &[0xAB, 0xCD]),
+            _ => panic!("expected Turbo"),
+        }
+    }
+
+    #[cfg(miri)]
+    #[test]
+    #[ignore] // croaring (C FFI) can't run under Miri
+    fn miri_serialize_roundtrip_sq8() {
+        let nodes = dashmap::DashMap::new();
+        let neighbor_index = crate::index::neighbor_index::HnswNeighborIndex::new();
+        nodes.insert(
+            1u128,
+            HnswNode {
+                id: 1,
+                bitset: FilterBitset::new(),
+                vec_data: VectorRepresentations::SQ8(
+                    vec![10i8, -20, 30, -40].into_boxed_slice(),
+                    2.5,
+                ),
+                storage_offset: 0,
+                inv_cached_norm: 0.0,
+                norm_sq: 0.0,
+                flags: 0,
+                neighbor_lists: Vec::new(),
+            },
+        );
+        neighbor_index.allocate(1, 1);
+        neighbor_index.set_neighbors(1, 0, smallvec::smallvec![]);
+        let index = CPIndex {
+            nodes,
+            neighbor_index,
+            max_layer: AtomicUsize::new(0),
+            entry_point: AtomicU128::new(ENTRY_POINT_NONE),
+            backend: IndexBackend::InMemory,
+            config: HnswConfig::default(),
+            total_nodes: AtomicU64::new(1),
+            rng: parking_lot::Mutex::new(rand::rngs::StdRng::seed_from_u64(42)),
+            ivf_index: parking_lot::Mutex::new(None),
+        };
+        let bytes = index.serialize_to_bytes();
+        let deser = CPIndex::deserialize_from_bytes(&bytes, true).unwrap();
+        let node = deser.nodes.get(&1).unwrap();
+        match &node.vec_data {
+            VectorRepresentations::SQ8(d, scale) => {
+                assert_eq!(d.as_ref(), &[10i8, -20, 30, -40]);
+                assert!((scale - 2.5).abs() < f32::EPSILON);
+            }
+            _ => panic!("expected SQ8"),
+        }
+    }
+
+    #[cfg(miri)]
+    #[test]
+    #[ignore] // croaring (C FFI) can't run under Miri
+    fn miri_serialize_roundtrip_none() {
+        let nodes = dashmap::DashMap::new();
+        let neighbor_index = crate::index::neighbor_index::HnswNeighborIndex::new();
+        nodes.insert(
+            1u128,
+            HnswNode {
+                id: 1,
+                bitset: FilterBitset::new(),
+                vec_data: VectorRepresentations::None,
+                storage_offset: 0,
+                inv_cached_norm: 0.0,
+                norm_sq: 0.0,
+                flags: 0,
+                neighbor_lists: Vec::new(),
+            },
+        );
+        neighbor_index.allocate(1, 1);
+        neighbor_index.set_neighbors(1, 0, smallvec::smallvec![]);
+        let index = CPIndex {
+            nodes,
+            neighbor_index,
+            max_layer: AtomicUsize::new(0),
+            entry_point: AtomicU128::new(ENTRY_POINT_NONE),
+            backend: IndexBackend::InMemory,
+            config: HnswConfig::default(),
+            total_nodes: AtomicU64::new(1),
+            rng: parking_lot::Mutex::new(rand::rngs::StdRng::seed_from_u64(42)),
+            ivf_index: parking_lot::Mutex::new(None),
+        };
+        let bytes = index.serialize_to_bytes();
+        let deser = CPIndex::deserialize_from_bytes(&bytes, true).unwrap();
+        let node = deser.nodes.get(&1).unwrap();
+        assert!(node.vec_data.is_none());
+    }
+
+    #[cfg(miri)]
+    #[test]
+    #[ignore] // croaring (C FFI) can't run under Miri
+    fn miri_serialize_roundtrip_all_variants_together() {
+        // Build an index with all vector variants to test mixed serialization.
+        let neighbor_index = crate::index::neighbor_index::HnswNeighborIndex::new();
+        let mut index = CPIndex::new();
+        // Clear default empty state
+        index.nodes.clear();
+
+        // Full
+        index.nodes.insert(
+            1,
+            HnswNode {
+                id: 1,
+                bitset: FilterBitset::new(),
+                vec_data: VectorRepresentations::Full(vec![0.1, 0.2, 0.3, 0.4]),
+                storage_offset: 0,
+                inv_cached_norm: 1.0,
+                norm_sq: 1.0,
+                flags: 0,
+                neighbor_lists: Vec::new(),
+            },
+        );
+        neighbor_index.allocate(1, 1);
+        neighbor_index.set_neighbors(1, 0, smallvec::smallvec![2, 3]);
+        // Binary
+        index.nodes.insert(
+            2,
+            HnswNode {
+                id: 2,
+                bitset: FilterBitset::new(),
+                vec_data: VectorRepresentations::Binary(vec![0xAA, 0xBB].into_boxed_slice()),
+                storage_offset: 0,
+                inv_cached_norm: 0.0,
+                norm_sq: 0.0,
+                flags: 0,
+                neighbor_lists: Vec::new(),
+            },
+        );
+        neighbor_index.allocate(2, 1);
+        neighbor_index.set_neighbors(2, 0, smallvec::smallvec![1, 3]);
+        // Turbo
+        index.nodes.insert(
+            3,
+            HnswNode {
+                id: 3,
+                bitset: FilterBitset::new(),
+                vec_data: VectorRepresentations::Turbo(vec![0x10, 0x20].into_boxed_slice()),
+                storage_offset: 0,
+                inv_cached_norm: 0.0,
+                norm_sq: 0.0,
+                flags: 0,
+                neighbor_lists: Vec::new(),
+            },
+        );
+        neighbor_index.allocate(3, 1);
+        neighbor_index.set_neighbors(3, 0, smallvec::smallvec![1, 2]);
+        // None
+        index.nodes.insert(
+            4,
+            HnswNode {
+                id: 4,
+                bitset: FilterBitset::new(),
+                vec_data: VectorRepresentations::None,
+                storage_offset: 0,
+                inv_cached_norm: 0.0,
+                norm_sq: 0.0,
+                flags: 0,
+                neighbor_lists: Vec::new(),
+            },
+        );
+        neighbor_index.allocate(4, 1);
+        neighbor_index.set_neighbors(4, 0, smallvec::smallvec![]);
+        index.neighbor_index = neighbor_index;
+
+        index.max_layer = AtomicUsize::new(0);
+        index.entry_point = AtomicU128::new(1);
+        index.total_nodes = AtomicU64::new(4);
+
+        let bytes = index.serialize_to_bytes();
+        let deser = CPIndex::deserialize_from_bytes(&bytes, true).unwrap();
+        assert_eq!(deser.nodes.len(), 4);
     }
 }

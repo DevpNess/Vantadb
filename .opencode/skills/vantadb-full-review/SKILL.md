@@ -1,12 +1,18 @@
 ---
 name: vantadb-full-review
 description: >
-  Comprehensive multi-layer review of the entire VantaDB project.
-  Covers Rust core, Python SDK, web frontend, TypeScript SDK, CI/CD, docs,
-  security, performance, dependencies, architecture, design, and accessibility.
-  Runs ALL available diagnostic tools and produces a structured report.
+  [DEPRECATED] Comprehensive multi-layer review of the entire VantaDB project.
+  Replaced by unified-review --profile vantadb. This file kept only for
+  git history — do not load or invoke.
+status: deprecated
+superseded_by: unified-review
 compatibility: opencode
 ---
+
+# ⚠️ DEPRECATED — Replaced by unified-review
+
+> **Do not use.** This skill is superseded by `skill unified-review --profile vantadb`.
+> Kept only for git history. No active references remain.
 
 # VantaDB Full Project Review
 
@@ -321,11 +327,11 @@ npx tsc --noEmit 2>&1 | tail -20
 # Lint
 npx eslint . --ext .ts,.tsx 2>&1 | tail -20
 
-# Bundle size
-npx vite build 2>&1 | tail -10
+# Bundle size (Next.js)
+npx next build 2>&1 | tail -10
 
 # Squirrelscan audit (si está instalado)
-squirrelscan --url http://localhost:5173 --format json 2>&1 | tail -30
+squirrelscan --url http://localhost:3000 --format json 2>&1 | tail -30
 ```
 
 ### Checklist manual
@@ -384,7 +390,7 @@ squirrelscan --url http://localhost:5173 --format json 2>&1 | tail -30
 
 ```bash
 # Buscar el directorio del TS SDK
-cd packages/
+cd vantadb-ts/
 npx tsc --noEmit 2>&1 | tail -20
 npx vitest run 2>&1 | tail -20
 
@@ -818,7 +824,7 @@ Errores concretos que rompen build, tests, o runtime.
 | Subcategoría | Qué buscar | Herramienta/Skill |
 |-------------|-----------|-------------------|
 | **Compilation error** | Cargo/tsc/build falla | `cargo check`, `npx tsc` |
-| **Test failure** | Test(s) que fallan consistentemente | `cargo nextest`, `pytest`, `vitest` |
+| **Test failure** | Test(s) que fallan consistentemente | `cargo nextest`, `pytest` |
 | **Flaky test** | Test que falla intermitentemente | `cargo nextest --retries 3` |
 | **Build warning como error** | `-D warnings` causa falla | `cargo clippy -- -D warnings` |
 | **Runtime panic** | `panic!` o `unreachable!` alcanzable en runtime | `codegraph_explore` |
@@ -1119,7 +1125,7 @@ OWASP ASVS v5.0, CodeClimate/Qlty maintainability scoring, y GitHub Actions CI s
 Cargá la skill y especificá la capa:
 
 ```
-skill vantadb-full-review
+# DEPRECATED — use skill unified-review --profile vantadb
 Revisá solo la capa Rust Core Layer del proyecto VantaDB.
 ```
 
@@ -1147,7 +1153,7 @@ Revisá solo la capa Rust Core Layer del proyecto VantaDB.
 | `codegraph_explore` | Análisis estructural, blast radius |
 | `rust-analyzer-mcp diagnostics` | Errores de compilación por archivo |
 | `npx tsc --noEmit` | TypeScript check |
-| `npx vitest run` | Tests de TS/web |
+| `npx vitest run` | Tests de TS SDK (`vantadb-ts/`) |
 | `dev-tools/setup_venv.ps1` | Build Python SDK |
 | `pytest` | Tests de Python SDK |
 | `just verify` | Pre-flight completo |

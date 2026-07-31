@@ -1,3 +1,4 @@
+use crate::index::search::SearchProfile;
 #[cfg(not(feature = "memmap2"))]
 use crate::storage::vfile::MmapMut;
 use ahash::RandomState;
@@ -91,6 +92,25 @@ pub unsafe fn release_mmap_vector(mmap_ptr: *const u8, offset: usize, len: usize
 }
 
 use crate::config::PrefetchMode;
+
+/// Report from a single FreshHNSW repair pass.
+///
+/// FreshHNSW scans all nodes in the HNSW graph and removes
+/// neighbor links that point to node IDs no longer present in the index
+/// ("orphan links" left behind by delete operations).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FreshHnswReport {
+    /// Number of HNSW nodes scanned.
+    pub scanned_nodes: u64,
+    /// Total number of layers (across all nodes) checked.
+    pub total_layers: u64,
+    /// Number of orphan neighbor links removed.
+    pub repaired_links: u64,
+    /// Duration of the repair pass in milliseconds.
+    pub duration_ms: u64,
+    /// Whether the pass completed successfully.
+    pub success: bool,
+}
 use std::sync::OnceLock;
 
 static PREFETCH_MODE: OnceLock<PrefetchMode> = OnceLock::new();
@@ -118,17 +138,22 @@ pub(crate) fn should_prefetch() -> bool {
     }
 }
 
-pub(crate) const VECTOR_INDEX_VERSION: u16 = 7;
+/// Current HNSW vector index format version.
+pub const VECTOR_INDEX_VERSION: u16 = 8;
 
 pub struct HnswNode {
     pub id: u128,
     pub bitset: FilterBitset,
     pub vec_data: VectorRepresentations,
-    pub neighbors: Vec<NeighborVec>,
     pub storage_offset: u64,
     pub inv_cached_norm: f32,
     pub norm_sq: f32,
     pub flags: u32,
+    /// Inline neighbor lists per layer (index = layer number).
+    /// Populated during insert/shrink to avoid a separate `neighbor_index` DashMap
+    /// lookup in `search_layer`. Falls back to `neighbor_index` if empty.
+    /// Thread-safe because DashMap shard RwLock protects concurrent reads/writes.
+    pub neighbor_lists: Vec<NeighborVec>,
 }
 
 impl HnswNode {
@@ -212,6 +237,14 @@ pub struct HnswConfig {
     /// Default: `Some(10000)`. Set to `None` to always use HNSW.
     #[serde(default = "default_flat_threshold")]
     pub flat_threshold: Option<usize>,
+    /// Index type: HNSW (default) or IVF.
+    /// IVF is rebuilt lazily on first search after load.
+    #[serde(default)]
+    pub index_type: crate::index::IndexType,
+    /// Whether adaptive ef_search auto-tuning is enabled.
+    /// Default: `false`.
+    #[serde(default)]
+    pub auto_tune: bool,
 }
 
 const fn default_flat_threshold() -> Option<usize> {
@@ -223,11 +256,13 @@ impl Default for HnswConfig {
         Self {
             m: 32,
             m_max0: 64,
-            ef_construction: 400,
+            ef_construction: 100,
             ef_search: 100,
             ml: 1.0 / (32_f64).ln(),
             distance_metric: DistanceMetric::Cosine,
             flat_threshold: Some(10000),
+            index_type: crate::index::IndexType::Hnsw,
+            auto_tune: false,
         }
     }
 }
@@ -287,7 +322,29 @@ pub struct CPIndex {
     pub backend: IndexBackend,
     pub config: HnswConfig,
     pub total_nodes: AtomicU64,
+    /// RNG for HNSW level assignment (`random_layer`).
+    ///
+    /// # Contention note (REV-012)
+    /// Parking lot Mutex is fast (no syscall uncontested), hold time ≈2-5µs
+    /// (one `random_range` call). Micro-batching (HNSW_BATCH_SIZE=64) means
+    /// 64 acquisitions per batch → ~128-320µs serialized insert_lock time.
+    ///
+    /// DashMap sharding (`nodes`) is adequate — default shard count is
+    /// `num_cpus * 4`, so concurrent inserts to different shards see no
+    /// contention. `search_layer` only holds shard read locks briefly.
+    ///
+    /// ponytail: Not a measured bottleneck. If profiling later shows this
+    /// as hot, switch to `thread_local! { static RNG: RefCell<SmallRng> }`
+    /// seeded from `seed_from_u64(42 ^ thread_id)` — eliminates the Mutex
+    /// entirely (~20 line change, no correctness impact on HNSW topology
+    /// since layer assignment is idempotent across runs).
     pub(crate) rng: parking_lot::Mutex<rand::rngs::StdRng>,
+    /// Lazy-built IVF index. Will be `None` until first search with
+    /// `config.index_type == IndexType::Ivf`.
+    pub ivf_index: parking_lot::Mutex<Option<crate::index::ivf::IvfIndex>>,
+    /// Flat, lock-friendly neighbor list index.
+    /// `pub(crate)` because `HnswNeighborIndex` is only `pub(crate)`.
+    pub(crate) neighbor_index: crate::index::neighbor_index::HnswNeighborIndex,
 }
 
 use crate::index::distance::f32_l2_norm;
@@ -324,6 +381,8 @@ impl CPIndex {
             config,
             total_nodes: AtomicU64::new(0),
             rng: parking_lot::Mutex::new(rand::rngs::StdRng::seed_from_u64(42)),
+            ivf_index: parking_lot::Mutex::new(None),
+            neighbor_index: crate::index::neighbor_index::HnswNeighborIndex::new(),
         }
     }
 
@@ -351,13 +410,15 @@ impl CPIndex {
                 VectorRepresentations::SQ8(d, _) => total += d.len() + 4,
                 VectorRepresentations::None => {}
             }
-            for layer in &node.neighbors {
-                total +=
-                    layer.len() * std::mem::size_of::<u128>() + std::mem::size_of::<NeighborVec>();
-            }
             total += std::mem::size_of::<HnswNode>();
         }
         total += self.total_nodes.load(Ordering::Relaxed) as usize * 60;
+        // Rough estimate for neighbor index storage (DashMap entries)
+        for entry in self.neighbor_index.id_to_meta.iter() {
+            let num_layers = *entry.value();
+            total += num_layers
+                * (std::mem::size_of::<(u128, usize)>() + std::mem::size_of::<NeighborVec>());
+        }
         total
     }
 
@@ -380,7 +441,7 @@ impl CPIndex {
     pub fn find_new_entry_point(&self) -> Option<u128> {
         self.nodes
             .iter()
-            .max_by_key(|kv| kv.value().neighbors.len())
+            .max_by_key(|kv| self.neighbor_index.num_layers(*kv.key()).unwrap_or(0))
             .map(|kv| *kv.key())
     }
 
@@ -452,17 +513,18 @@ impl CPIndex {
         }
 
         if vec_data.is_none() {
+            self.neighbor_index.allocate(id, 1);
             self.nodes.insert(
                 id,
                 HnswNode {
                     id,
                     bitset,
                     vec_data: vec_data.clone(),
-                    neighbors: vec![NeighborVec::new()],
                     storage_offset,
                     inv_cached_norm: 0.0,
                     norm_sq: 0.0,
                     flags: 0,
+                    neighbor_lists: Vec::new(),
                 },
             );
             self.total_nodes.fetch_add(1, Ordering::Relaxed);
@@ -487,6 +549,24 @@ impl CPIndex {
         self.insert_hnsw(id, bitset, vec_data, storage_offset);
     }
 
+    /// Add a node with a pre-computed HNSW layer level (avoids `random_layer()`).
+    /// Used for parallel rebuild where each thread computes its own levels
+    /// to avoid contention on the shared RNG mutex.
+    pub fn add_with_level(
+        &self,
+        id: u128,
+        bitset: FilterBitset,
+        vec_data: VectorRepresentations,
+        storage_offset: u64,
+        level: usize,
+    ) {
+        if self.validate_node(id, bitset.clone(), &vec_data, storage_offset) {
+            return;
+        }
+
+        self.insert_hnsw_with_level(id, bitset, vec_data, storage_offset, level);
+    }
+
     #[inline]
     pub(crate) fn compute_cached_norms(&self, vec_data: &VectorRepresentations) -> (f32, f32) {
         cached_norms_for_metric(self.config.distance_metric, vec_data)
@@ -509,15 +589,18 @@ impl CPIndex {
             None => return,
         };
 
+        self.neighbor_index.allocate(id, level + 1);
+        let empty_layers = vec![NeighborVec::new(); level + 1];
+
         let node = HnswNode {
             id,
             bitset,
             vec_data,
-            neighbors: vec![NeighborVec::new(); level + 1],
             storage_offset,
             inv_cached_norm,
             norm_sq,
             flags: 0,
+            neighbor_lists: empty_layers,
         };
 
         let ep = match self.get_entry_point() {
@@ -552,7 +635,10 @@ impl CPIndex {
 
         let mut curr_entry_points = vec![ep];
         let mut visited: std::collections::HashSet<u128, RandomState> =
-            std::collections::HashSet::with_capacity_and_hasher(ef_cons * 2, RandomState::new());
+            std::collections::HashSet::with_capacity_and_hasher(
+                ef_cons.saturating_mul(3),
+                RandomState::new(),
+            );
         let top_layer = self.max_layer.load(Ordering::Acquire);
 
         for layer in (level + 1..=top_layer).rev() {
@@ -565,9 +651,11 @@ impl CPIndex {
                 1,
                 layer,
                 &crate::node::ALL_BITSET,
+                false, // no ACORN during construction
                 None,
                 self.config.distance_metric,
                 &mut visited,
+                &mut SearchProfile::new(),
             );
             if let Some(NodeSimMin(_, best_id)) = w.pop() {
                 curr_entry_points = vec![best_id];
@@ -585,9 +673,11 @@ impl CPIndex {
                 ef_cons,
                 layer,
                 &crate::node::ALL_BITSET,
+                false, // no ACORN during construction
                 None,
                 self.config.distance_metric,
                 &mut visited,
+                &mut SearchProfile::new(),
             );
 
             let m_max = if layer == 0 {
@@ -599,11 +689,155 @@ impl CPIndex {
             curr_entry_points = w.iter().map(|ns| ns.1).collect();
             let selected_neighbors = self.select_neighbors(w, m_max);
 
-            if let Some(mut n) = self.nodes.get_mut(&id) {
-                n.neighbors[layer] = selected_neighbors.clone();
-            }
-
+            // Connect reverse links first (reads &selected_neighbors by ref),
+            // then store the pruned list — avoids cloning for set_neighbors.
             self.connect_layer_neighbors(id, &selected_neighbors, layer, m_max);
+
+            // Populate both neighbor_index and inline cache.
+            // Inline cache avoids a 2nd DashMap fallback in search_layer during rebuild.
+            let inline_cache = selected_neighbors.clone();
+            self.neighbor_index
+                .set_neighbors(id, layer, selected_neighbors);
+            if let Some(mut node_ref) = self.nodes.get_mut(&id) {
+                if node_ref.neighbor_lists.len() > layer {
+                    node_ref.neighbor_lists[layer] = inline_cache;
+                }
+            }
+        }
+
+        self.update_metadata(level, id);
+    }
+
+    fn insert_hnsw_with_level(
+        &self,
+        id: u128,
+        bitset: FilterBitset,
+        vec_data: VectorRepresentations,
+        storage_offset: u64,
+        level: usize,
+    ) {
+        let ef_cons = self.config.ef_construction;
+
+        let (inv_cached_norm, norm_sq) = self.compute_cached_norms(&vec_data);
+
+        let query_f32 = match vec_data.to_f32() {
+            Some(v) => v,
+            None => return,
+        };
+
+        self.neighbor_index.allocate(id, level + 1);
+        let empty_layers = vec![NeighborVec::new(); level + 1];
+
+        let node = HnswNode {
+            id,
+            bitset,
+            vec_data,
+            storage_offset,
+            inv_cached_norm,
+            norm_sq,
+            flags: 0,
+            neighbor_lists: empty_layers,
+        };
+
+        let ep = match self.get_entry_point() {
+            None => {
+                self.set_entry_point(id);
+                self.max_layer.store(level, Ordering::Release);
+                self.nodes.insert(id, node);
+                self.total_nodes.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            Some(entry) => entry,
+        };
+
+        self.nodes.insert(id, node);
+        self.total_nodes.fetch_add(1, Ordering::Relaxed);
+
+        let (query_norm, query_inv_norm) = match self.config.distance_metric {
+            DistanceMetric::Cosine => {
+                let norm = f32_l2_norm(&query_f32);
+                if norm < f32::EPSILON {
+                    self.nodes.remove(&id);
+                    self.total_nodes.fetch_sub(1, Ordering::Relaxed);
+                    return;
+                }
+                (Some(norm), Some(1.0 / norm))
+            }
+            DistanceMetric::Euclidean => {
+                let norm = f32_l2_norm(&query_f32);
+                (Some(norm), None)
+            }
+        };
+
+        let mut curr_entry_points = vec![ep];
+        let mut visited: std::collections::HashSet<u128, RandomState> =
+            std::collections::HashSet::with_capacity_and_hasher(
+                ef_cons.saturating_mul(3),
+                RandomState::new(),
+            );
+        let top_layer = self.max_layer.load(Ordering::Acquire);
+
+        for layer in (level + 1..=top_layer).rev() {
+            visited.clear();
+            let mut w = self.search_layer(
+                &query_f32,
+                query_norm,
+                query_inv_norm,
+                &curr_entry_points,
+                1,
+                layer,
+                &crate::node::ALL_BITSET,
+                false,
+                None,
+                self.config.distance_metric,
+                &mut visited,
+                &mut SearchProfile::new(),
+            );
+            if let Some(NodeSimMin(_, best_id)) = w.pop() {
+                curr_entry_points = vec![best_id];
+            }
+        }
+
+        let start_layer = std::cmp::min(level, top_layer);
+        for layer in (0..=start_layer).rev() {
+            visited.clear();
+            let w = self.search_layer(
+                &query_f32,
+                query_norm,
+                query_inv_norm,
+                &curr_entry_points,
+                ef_cons,
+                layer,
+                &crate::node::ALL_BITSET,
+                false,
+                None,
+                self.config.distance_metric,
+                &mut visited,
+                &mut SearchProfile::new(),
+            );
+
+            let m_max = if layer == 0 {
+                self.config.m_max0
+            } else {
+                self.config.m
+            };
+
+            curr_entry_points = w.iter().map(|ns| ns.1).collect();
+            let selected_neighbors = self.select_neighbors(w, m_max);
+
+            // Connect reverse links first (reads &selected_neighbors by ref),
+            // then store the pruned list — avoids cloning for set_neighbors.
+            self.connect_layer_neighbors(id, &selected_neighbors, layer, m_max);
+
+            // Populate both neighbor_index and inline cache.
+            let inline_cache = selected_neighbors.clone();
+            self.neighbor_index
+                .set_neighbors(id, layer, selected_neighbors);
+            if let Some(mut node_ref) = self.nodes.get_mut(&id) {
+                if node_ref.neighbor_lists.len() > layer {
+                    node_ref.neighbor_lists[layer] = inline_cache;
+                }
+            }
         }
 
         self.update_metadata(level, id);
@@ -617,28 +851,14 @@ impl CPIndex {
         m_max: usize,
     ) {
         for &neighbor_id in selected_neighbors {
-            let (needs_shrink, current_neighbors) = {
-                if let Some(mut neighbor_node) = self.nodes.get_mut(&neighbor_id) {
-                    if layer < neighbor_node.neighbors.len() {
-                        if !neighbor_node.neighbors[layer].contains(&id) {
-                            neighbor_node.neighbors[layer].push(id);
-                        }
+            // Single DashMap access: try-add reverse link + check if shrink needed.
+            // Replaces the old 3-access pattern (add_neighbor + len_neighbors + get_neighbors).
+            let (_added, maybe_full_list) =
+                self.neighbor_index
+                    .try_add_and_get_if_full(neighbor_id, layer, id, m_max);
 
-                        if neighbor_node.neighbors[layer].len() > m_max {
-                            (true, neighbor_node.neighbors[layer].clone())
-                        } else {
-                            (false, NeighborVec::new())
-                        }
-                    } else {
-                        (false, NeighborVec::new())
-                    }
-                } else {
-                    (false, NeighborVec::new())
-                }
-            };
-
-            if needs_shrink {
-                self.shrink_neighbors(neighbor_id, m_max, &current_neighbors, layer);
+            if let Some(full_list) = maybe_full_list {
+                self.shrink_neighbors(neighbor_id, m_max, &full_list, layer);
             }
         }
     }
@@ -651,6 +871,7 @@ impl CPIndex {
         current_neighbors: &[u128],
         layer: usize,
     ) {
+        // 1. Read the node's vector data and cached norm
         let (nb_vec, nb_inv_norm) = match self.nodes.get(&neighbor_id) {
             Some(n) => (
                 n.vec_data.as_f32_slice().map(|s| s.to_vec()),
@@ -684,8 +905,14 @@ impl CPIndex {
                 }
             }
             let pruned = self.select_neighbors(cand_heap, m_max);
-            if let Some(mut neighbor_node) = self.nodes.get_mut(&neighbor_id) {
-                neighbor_node.neighbors[layer] = pruned;
+            // Populate both neighbor_index and inline cache.
+            let inline_cache = pruned.clone();
+            self.neighbor_index
+                .set_neighbors(neighbor_id, layer, pruned);
+            if let Some(mut node_ref) = self.nodes.get_mut(&neighbor_id) {
+                if node_ref.neighbor_lists.len() > layer {
+                    node_ref.neighbor_lists[layer] = inline_cache;
+                }
             }
         }
     }
@@ -711,9 +938,14 @@ impl CPIndex {
 
             while let Some(node_id) = queue.pop_front() {
                 order.push(node_id);
-                if let Some(node) = self.nodes.get(&node_id) {
-                    for layer in (0..node.neighbors.len()).rev() {
-                        for &neighbor_id in &node.neighbors[layer] {
+                if self.nodes.contains_key(&node_id) {
+                    let num_layers = self.neighbor_index.num_layers(node_id).unwrap_or(0);
+                    for layer in (0..num_layers).rev() {
+                        let neighbors = self
+                            .neighbor_index
+                            .get_neighbors(node_id, layer)
+                            .unwrap_or_default();
+                        for &neighbor_id in &neighbors {
                             if seen.insert(neighbor_id) {
                                 queue.push_back(neighbor_id);
                             }
@@ -733,6 +965,78 @@ impl CPIndex {
         order.extend(orphans);
         order
     }
+
+    /// Scans all nodes in the graph and removes neighbor links that point
+    /// to node IDs that no longer exist in `self.nodes` (orphan links).
+    ///
+    /// Orphan links accumulate when nodes are removed via `apply_delete`
+    /// (which removes the node from `self.nodes` but does not update the
+    /// neighbor lists of surviving nodes). This degrades search quality
+    /// over time because the graph becomes less navigable.
+    ///
+    /// # ponytail
+    /// O(n × m × layers) scan. For ~10M nodes with M=32, that is ~320M
+    /// `contains_key` checks. Do not optimize prematuramente.
+    ///
+    /// # Deadlock avoidance
+    /// DashMap's `iter()` locks **all** shards. Calling `contains_key()` or
+    /// `get_mut()` while the iter lock is held would deadlock. This method
+    /// uses a three-phase approach:
+    ///   1. Snapshot all existing node IDs into a local HashSet.
+    ///   2. Scan neighbor lists under the iter lock (read-only, using the
+    ///      snapshot for existence checks). Record (node_id, layer) pairs
+    ///      that need repair.
+    ///   3. Repair each recorded pair with `get_mut()` — iter lock is
+    ///      released, so only one shard is locked at a time.
+    pub fn repair_orphan_links(&self) -> FreshHnswReport {
+        let start = std::time::Instant::now();
+
+        // Phase 1: Snapshot all existing node IDs into a local HashSet.
+        let active_nodes: std::collections::HashSet<u128> =
+            self.nodes.iter().map(|kv| *kv.key()).collect();
+
+        // Phase 2: Scan neighbor lists via neighbor_index.for_each(), identify
+        // orphan links (neighbor IDs not in active_nodes). Record (node_id, layer)
+        // pairs that need repair and count all individual orphan links found.
+        let mut scanned_nodes: u64 = 0;
+        let mut total_layers: u64 = 0;
+        let mut orphan_count: u64 = 0;
+        let mut to_repair: Vec<(u128, usize)> = Vec::new();
+
+        self.neighbor_index.for_each(|node_id, layers| {
+            scanned_nodes += 1;
+            for (layer_idx, neighbors) in layers.iter().enumerate() {
+                total_layers += 1;
+                let mut layer_has_orphan = false;
+                for &nid in neighbors {
+                    if !active_nodes.contains(&nid) {
+                        orphan_count += 1;
+                        layer_has_orphan = true;
+                    }
+                }
+                if layer_has_orphan {
+                    to_repair.push((node_id, layer_idx));
+                }
+            }
+        });
+
+        // Phase 3: Repair each recorded layer — retain only links whose
+        // target ID exists in active_nodes.
+        for (node_id, layer) in &to_repair {
+            self.neighbor_index
+                .retain_neighbors(*node_id, *layer, |nid| active_nodes.contains(nid));
+        }
+
+        let duration_ms = start.elapsed().as_millis() as u64;
+
+        FreshHnswReport {
+            scanned_nodes,
+            total_layers,
+            repaired_links: orphan_count,
+            duration_ms,
+            success: true,
+        }
+    }
 }
 
 impl Default for CPIndex {
@@ -741,10 +1045,160 @@ impl Default for CPIndex {
     }
 }
 
+/// Compute a random HNSW layer level from a generic RNG.
+/// Used by parallel rebuild to avoid contention on `CPIndex::rng` mutex.
+pub fn random_layer_from_config<R: rand::Rng>(config: &HnswConfig, rng: &mut R) -> usize {
+    let r: f64 = rng.random_range(0.0001..1.0);
+    (-r.ln() * config.ml).floor() as usize
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::node::ALL_BITSET;
+
+    // ── Miri tests for unsafe patterns ──────────────────────────────
+    //
+    // graph.rs has 3 unsafe patterns: prefetch_mmap_vector (madvise),
+    // release_mmap_vector (madvise), and mmap_resident_bytes (Mmap::map).
+    // These all require actual system calls that Miri cannot execute
+    // (MIRI_NO_HOST_FALLBACK=1).
+    //
+    // INSTEAD, these Miri tests exercise HNSW graph construction and
+    // search. This transitively covers the unsafe in distance.rs
+    // (chunks_exact + unwrap_unchecked — 14 blocks) through the
+    // insert_hnsw → search_layer → fast_similarity → distance kernel
+    // call chain, plus the dispatch via select_kernels().
+
+    #[cfg(miri)]
+    #[test]
+    #[ignore] // croaring (C FFI) can't run under Miri
+    fn miri_graph_hnsw_build_and_search() {
+        let config = HnswConfig {
+            m: 8,
+            m_max0: 16,
+            ef_construction: 50,
+            ef_search: 50,
+            ml: 1.0 / (8_f64).ln(),
+            distance_metric: DistanceMetric::Cosine,
+            flat_threshold: None, // force HNSW path
+            index_type: crate::index::IndexType::Hnsw,
+            auto_tune: false,
+        };
+        let index = CPIndex::new_with_config(config);
+
+        // Insert vectors — this calls insert_hnsw → distance kernels
+        for i in 0u128..5 {
+            let v: Vec<f32> = (0..8).map(|d| ((i * 8 + d) as f32).sin()).collect();
+            index.add(i, FilterBitset::new(), VectorRepresentations::Full(v), 0);
+        }
+        assert_eq!(index.nodes.len(), 5);
+        assert!(index.get_entry_point().is_some());
+
+        // Search — this calls search_layer → fast_similarity → distance kernels
+        let query: Vec<f32> = (0..8).map(|d| (d as f32).sin()).collect();
+        let results = index.search_nearest(&query, None, None, &ALL_BITSET, 3, None);
+        assert!(!results.is_empty());
+        for &(id, score) in &results {
+            assert!(score.is_finite(), "score for id={} should be finite", id);
+        }
+    }
+
+    #[cfg(miri)]
+    #[test]
+    #[ignore] // croaring (C FFI) can't run under Miri
+    fn miri_graph_hnsw_euclidean() {
+        let config = HnswConfig {
+            m: 8,
+            m_max0: 16,
+            ef_construction: 50,
+            ef_search: 50,
+            ml: 1.0 / (8_f64).ln(),
+            distance_metric: DistanceMetric::Euclidean,
+            flat_threshold: None,
+            index_type: crate::index::IndexType::Hnsw,
+            auto_tune: false,
+        };
+        let index = CPIndex::new_with_config(config);
+
+        // Insert points in 4D — tests the f32x8 kernels with size < 8 (sub-chunk path)
+        let vectors: Vec<Vec<f32>> = vec![
+            vec![1.0, 0.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0, 0.0],
+            vec![0.0, 0.0, 1.0, 0.0],
+            vec![0.0, 0.0, 0.0, 1.0],
+        ];
+        for (i, v) in vectors.iter().enumerate() {
+            index.add(
+                i as u128,
+                FilterBitset::new(),
+                VectorRepresentations::Full(v.clone()),
+                0,
+            );
+        }
+
+        let query = vec![1.0, 0.0, 0.0, 0.0];
+        let results = index.search_nearest(&query, None, None, &ALL_BITSET, 4, None);
+        assert!(!results.is_empty());
+        assert_eq!(results[0].0, 0, "identical vector should be closest");
+        for &(_, score) in &results {
+            assert!(score.is_finite(), "Euclidean score should be finite");
+        }
+    }
+
+    #[cfg(miri)]
+    #[test]
+    #[ignore] // croaring (C FFI) can't run under Miri
+    fn miri_graph_hnsw_multiple_layers() {
+        // Insert enough vectors to trigger multiple HNSW layers
+        let config = HnswConfig {
+            m: 4,
+            m_max0: 8,
+            ef_construction: 100,
+            ef_search: 100,
+            ml: 1.0 / (4_f64).ln(),
+            distance_metric: DistanceMetric::Cosine,
+            flat_threshold: None,
+            index_type: crate::index::IndexType::Hnsw,
+            auto_tune: false,
+        };
+        let index = CPIndex::new_with_config(config);
+
+        for i in 0u128..50 {
+            let v: Vec<f32> = (0..16).map(|d| ((i * 16 + d) as f32).cos()).collect();
+            index.add(i, FilterBitset::new(), VectorRepresentations::Full(v), 0);
+        }
+        assert_eq!(index.nodes.len(), 50);
+
+        let query: Vec<f32> = (0..16).map(|d| (d as f32).cos()).collect();
+        let results = index.search_nearest(&query, None, None, &ALL_BITSET, 5, None);
+        assert_eq!(results.len(), 5);
+        for &(_, score) in &results {
+            assert!(score.is_finite());
+        }
+    }
+
+    #[cfg(miri)]
+    #[test]
+    #[ignore] // croaring (C FFI) can't run under Miri
+    fn miri_graph_entry_point_management() {
+        let index = CPIndex::new();
+        assert!(index.get_entry_point().is_none());
+        assert!(index.find_new_entry_point().is_none());
+
+        // Add a node → entry point should be set
+        index.add(
+            42,
+            FilterBitset::new(),
+            VectorRepresentations::Full(vec![1.0, 0.0, 0.0, 0.0]),
+            0,
+        );
+        assert_eq!(index.get_entry_point(), Some(42));
+
+        // Check that we can set entry point
+        index.set_entry_point(99);
+        assert_eq!(index.get_entry_point(), Some(99));
+    }
 
     /// Euclidean distance invariants: identical vectors → score ≈ 0.0,
     /// all scores ≤ 0 (negative distance), descending order.
@@ -805,6 +1259,184 @@ mod tests {
                 window[0].1,
                 window[1].1
             );
+        }
+    }
+
+    // ── repair_orphan_links ─────────────────────────────────────────
+
+    #[test]
+    fn test_repair_orphan_links_empty_index() {
+        let index = CPIndex::new();
+        let report = index.repair_orphan_links();
+        assert_eq!(report.scanned_nodes, 0);
+        assert_eq!(report.total_layers, 0);
+        assert_eq!(report.repaired_links, 0);
+        assert!(report.success);
+    }
+
+    #[test]
+    fn test_repair_orphan_links_no_orphans() {
+        let index = CPIndex::new_with_config(HnswConfig {
+            m: 4,
+            m_max0: 8,
+            ef_construction: 50,
+            ef_search: 50,
+            ml: 1.0 / (4_f64).ln(),
+            distance_metric: DistanceMetric::Cosine,
+            flat_threshold: None,
+            index_type: crate::index::IndexType::Hnsw,
+            auto_tune: false,
+        });
+
+        // Insert nodes A, B, C — they form a connected graph with no orphans
+        for i in 0u128..5 {
+            let v: Vec<f32> = (0..8).map(|d| ((i * 8 + d) as f32).sin()).collect();
+            index.add(i, FilterBitset::new(), VectorRepresentations::Full(v), 0);
+        }
+
+        let report = index.repair_orphan_links();
+        assert!(report.scanned_nodes > 0, "should scan at least one node");
+        assert_eq!(report.repaired_links, 0, "no orphans expected");
+        assert!(report.success);
+    }
+
+    #[test]
+    fn test_repair_orphan_links_after_delete() {
+        let index = CPIndex::new_with_config(HnswConfig {
+            m: 8,
+            m_max0: 16,
+            ef_construction: 50,
+            ef_search: 50,
+            ml: 1.0 / (8_f64).ln(),
+            distance_metric: DistanceMetric::Cosine,
+            flat_threshold: None,
+            index_type: crate::index::IndexType::Hnsw,
+            auto_tune: false,
+        });
+
+        // Insert nodes 0, 1, 2 — they link to each other via HNSW
+        for i in 0u128..5 {
+            let v: Vec<f32> = (0..8).map(|d| ((i * 8 + d) as f32).sin()).collect();
+            index.add(i, FilterBitset::new(), VectorRepresentations::Full(v), 0);
+        }
+        assert_eq!(index.nodes.len(), 5);
+
+        // Manually add orphan links: give node 0 a link to node 99 (doesn't exist)
+        {
+            let mut l0 = index.neighbor_index.get_neighbors(0, 0).unwrap_or_default();
+            if !l0.contains(&99) {
+                l0.push(99);
+            }
+            index.neighbor_index.set_neighbors(0, 0, l0);
+        }
+        // Give node 1 a link to node 999 (doesn't exist)
+        {
+            let mut l0 = index.neighbor_index.get_neighbors(1, 0).unwrap_or_default();
+            if !l0.contains(&999) {
+                l0.push(999);
+            }
+            index.neighbor_index.set_neighbors(1, 0, l0);
+        }
+
+        // Remove node 2 from the index entirely (simulating delete)
+        let removed_node = index.nodes.remove(&2);
+        assert!(removed_node.is_some(), "node 2 should exist before removal");
+
+        // Now node 0 and node 1 both have orphan links to deleted/never-existing nodes.
+        // Node 2's neighbors (which we removed the node for) can't be checked since
+        // the node is gone, but other nodes that linked to node 2 now have orphan links.
+
+        let report = index.repair_orphan_links();
+        assert!(report.scanned_nodes > 0, "should scan nodes");
+        assert!(
+            report.repaired_links >= 2,
+            "should repair at least 2 orphan links (99, 999), got {}",
+            report.repaired_links
+        );
+        assert!(report.success);
+
+        // Verify the orphans were actually removed
+        if let Some(l0) = index.neighbor_index.get_neighbors(0, 0) {
+            assert!(!l0.contains(&99), "node 0 should no longer link to 99");
+        };
+        if let Some(l0) = index.neighbor_index.get_neighbors(1, 0) {
+            assert!(!l0.contains(&999), "node 1 should no longer link to 999");
+        };
+    }
+
+    #[test]
+    fn test_repair_orphan_links_multiple_layers() {
+        let index = CPIndex::new_with_config(HnswConfig {
+            m: 4,
+            m_max0: 8,
+            ef_construction: 100,
+            ef_search: 100,
+            ml: 1.0 / (4_f64).ln(),
+            distance_metric: DistanceMetric::Cosine,
+            flat_threshold: None,
+            index_type: crate::index::IndexType::Hnsw,
+            auto_tune: false,
+        });
+
+        // Insert enough nodes to create multi-layer graph
+        for i in 0u128..30 {
+            let v: Vec<f32> = (0..16).map(|d| ((i * 16 + d) as f32).cos()).collect();
+            index.add(i, FilterBitset::new(), VectorRepresentations::Full(v), 0);
+        }
+        assert_eq!(index.nodes.len(), 30);
+
+        // Inject orphan links at layers 0 and 1
+        for node_id in [0u128, 5, 10] {
+            let num_layers = index.neighbor_index.num_layers(node_id).unwrap_or(0);
+            for layer in 0..num_layers {
+                let mut l = index
+                    .neighbor_index
+                    .get_neighbors(node_id, layer)
+                    .unwrap_or_default();
+                if !l.contains(&100) {
+                    l.push(100);
+                }
+                if !l.contains(&200) {
+                    l.push(200);
+                }
+                if !l.contains(&300) {
+                    l.push(300);
+                }
+                index.neighbor_index.set_neighbors(node_id, layer, l);
+            }
+        }
+
+        // Remove some nodes to create more orphans
+        for id in [15u128, 20, 25] {
+            index.nodes.remove(&id);
+        }
+
+        let report = index.repair_orphan_links();
+        assert!(report.scanned_nodes > 0, "should scan nodes");
+        assert!(report.repaired_links > 0, "should repair orphan links");
+        assert!(
+            report.total_layers >= report.scanned_nodes,
+            "total layers >= scanned nodes"
+        );
+        assert!(report.success);
+
+        // Verify orphans are gone and legit links remain
+        for node_id in [0u128, 5, 10] {
+            let num_layers = index.neighbor_index.num_layers(node_id).unwrap_or(0);
+            for layer in 0..num_layers {
+                let l = index
+                    .neighbor_index
+                    .get_neighbors(node_id, layer)
+                    .unwrap_or_default();
+                assert!(
+                    !l.contains(&100),
+                    "node {node_id} layer {layer} should not link to 100"
+                );
+                assert!(
+                    !l.contains(&200),
+                    "node {node_id} layer {layer} should not link to 200"
+                );
+            }
         }
     }
 }

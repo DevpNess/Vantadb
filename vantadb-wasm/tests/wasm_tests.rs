@@ -4,7 +4,10 @@
 //! not run in a standard Rust test runner. Use `wasm-pack test --chrome` (or
 //! `--firefox` / `--safari`) to execute them.
 
-use vantadb_wasm::{OpfsStorage, VantaDB};
+use vantadb_wasm::{IdbStorage, OpfsFile, OpfsStorage, VantaDB};
+
+#[cfg(feature = "opfs")]
+use vantadb_wasm::worker::{OpfsWorker, WorkerRequest, WorkerResponse};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_test::*;
 
@@ -44,6 +47,11 @@ fn record_payload(record: &JsValue) -> String {
 
 async fn try_opfs(name: &str) -> Option<OpfsStorage> {
     OpfsStorage::open(name).await.ok()
+}
+
+/// Returns `true` if IndexedDB is available in this browser context.
+async fn try_idb() -> bool {
+    IdbStorage::is_available()
 }
 
 // ── OPFS Storage Tests ───────────────────────────────────────────────
@@ -197,6 +205,81 @@ async fn test_opfs_large_file() {
     assert_eq!(read_back, large);
 
     storage.delete_file("large.bin").await.unwrap();
+}
+
+#[wasm_bindgen_test]
+async fn test_opfs_append_new_file() {
+    let storage = match try_opfs("vantadb_test_append_new").await {
+        Some(s) => s,
+        None => return,
+    };
+
+    // append_file creates the file if it doesn't exist
+    storage
+        .append_file("append_new.bin", b"hello ")
+        .await
+        .unwrap();
+
+    let read_back = storage
+        .read_file("append_new.bin")
+        .await
+        .unwrap()
+        .expect("file should exist after append");
+    assert_eq!(read_back, b"hello ");
+
+    storage.delete_file("append_new.bin").await.unwrap();
+}
+
+#[wasm_bindgen_test]
+async fn test_opfs_append_to_existing() {
+    let storage = match try_opfs("vantadb_test_append_existing").await {
+        Some(s) => s,
+        None => return,
+    };
+
+    // Write initial content via OpfsFile directly (no CRC footer)
+    let file = OpfsFile::open(storage.dir_handle(), "append_existing.bin", true)
+        .await
+        .unwrap()
+        .expect("OpfsFile::open returned None with create=true");
+    file.write(b"hello ").await.unwrap();
+
+    // Append more data
+    storage
+        .append_file("append_existing.bin", b"world")
+        .await
+        .unwrap();
+
+    let read_back = storage
+        .read_file("append_existing.bin")
+        .await
+        .unwrap()
+        .expect("file should exist after append");
+    assert_eq!(read_back, b"hello world");
+
+    storage.delete_file("append_existing.bin").await.unwrap();
+}
+
+#[wasm_bindgen_test]
+async fn test_opfs_append_multiple() {
+    let storage = match try_opfs("vantadb_test_append_multi").await {
+        Some(s) => s,
+        None => return,
+    };
+
+    // Multiple appends in sequence
+    storage.append_file("append_multi.bin", b"a").await.unwrap();
+    storage.append_file("append_multi.bin", b"b").await.unwrap();
+    storage.append_file("append_multi.bin", b"c").await.unwrap();
+
+    let read_back = storage
+        .read_file("append_multi.bin")
+        .await
+        .unwrap()
+        .expect("file should exist after appends");
+    assert_eq!(read_back, b"abc");
+
+    storage.delete_file("append_multi.bin").await.unwrap();
 }
 
 // ── In-Memory Storage Tests ──────────────────────────────────────────
@@ -748,4 +831,498 @@ fn test_import_records_round_trip() {
         let got = db.get("import_test", &format!("import_{}", i)).unwrap();
         assert!(!got.is_null());
     }
+}
+
+// ── IndexedDB (IdbStorage) Storage Tests ─────────────────────────────
+
+#[wasm_bindgen_test]
+async fn test_idb_read_write_cycle() {
+    if !try_idb().await {
+        return;
+    }
+
+    let data: &[u8] = b"hello idb world";
+    IdbStorage::write_file("test_idb_file", data).await.unwrap();
+
+    let read_back = IdbStorage::read_file("test_idb_file")
+        .await
+        .unwrap()
+        .expect("file should exist");
+    assert_eq!(read_back, data);
+
+    IdbStorage::delete_file("test_idb_file").await.unwrap();
+
+    let after_delete = IdbStorage::read_file("test_idb_file").await.unwrap();
+    assert!(after_delete.is_none());
+}
+
+#[wasm_bindgen_test]
+async fn test_idb_overwrite() {
+    if !try_idb().await {
+        return;
+    }
+
+    IdbStorage::write_file("test_idb_over", b"version 1")
+        .await
+        .unwrap();
+    IdbStorage::write_file("test_idb_over", b"version 2")
+        .await
+        .unwrap();
+
+    let read_back = IdbStorage::read_file("test_idb_over")
+        .await
+        .unwrap()
+        .expect("file should exist after overwrite");
+    assert_eq!(read_back, b"version 2");
+
+    IdbStorage::delete_file("test_idb_over").await.unwrap();
+}
+
+#[wasm_bindgen_test]
+async fn test_idb_nonexistent_read() {
+    if !try_idb().await {
+        return;
+    }
+
+    let result = IdbStorage::read_file("nonexistent_idb_key_xyz")
+        .await
+        .unwrap();
+    assert!(result.is_none());
+}
+
+#[wasm_bindgen_test]
+async fn test_idb_nonexistent_delete() {
+    if !try_idb().await {
+        return;
+    }
+
+    // Delete of a non-existent key must not error (IndexedDB delete is idempotent).
+    IdbStorage::delete_file("nonexistent_idb_del")
+        .await
+        .unwrap();
+}
+
+#[wasm_bindgen_test]
+async fn test_idb_subscribe() {
+    if !try_idb().await {
+        return;
+    }
+
+    // Set up a global flag that the callback will toggle.
+    js_sys::eval("window.__idb_sub_fired = false; window.__idb_sub_key = null;").unwrap();
+
+    let cb = js_sys::Function::new_with_args(
+        "key",
+        "window.__idb_sub_fired = true; window.__idb_sub_key = key;",
+    );
+    let _unsub = IdbStorage::subscribe(&cb).unwrap();
+
+    // Write triggers BroadcastChannel postMessage → callback.
+    IdbStorage::write_file("sub_test_key", b"subscribe data")
+        .await
+        .unwrap();
+
+    // Yield so the queued BroadcastChannel message is delivered.
+    wasm_bindgen_futures::JsFuture::from(js_sys::Promise::resolve(&JsValue::undefined()))
+        .await
+        .unwrap();
+
+    let fired = js_sys::eval("window.__idb_sub_fired").unwrap();
+    assert!(
+        fired.is_truthy(),
+        "subscribe callback should have fired after write"
+    );
+
+    let key = js_sys::eval("window.__idb_sub_key").unwrap();
+    assert_eq!(key.as_string(), Some("sub_test_key".to_string()));
+
+    IdbStorage::delete_file("sub_test_key").await.unwrap();
+}
+
+#[wasm_bindgen_test]
+async fn test_idb_binary_data() {
+    if !try_idb().await {
+        return;
+    }
+
+    let binary: Vec<u8> = (0..255).collect();
+    IdbStorage::write_file("test_idb_binary", &binary)
+        .await
+        .unwrap();
+
+    let read_back = IdbStorage::read_file("test_idb_binary")
+        .await
+        .unwrap()
+        .expect("binary file should exist");
+    assert_eq!(read_back.len(), 255);
+    assert_eq!(read_back, binary);
+
+    IdbStorage::delete_file("test_idb_binary").await.unwrap();
+}
+
+// ── WASM Persistence Round-Trip Tests ────────────────────────────────
+
+#[wasm_bindgen_test]
+async fn test_wasm_persistence_roundtrip() {
+    if !try_idb().await {
+        return;
+    }
+
+    let db = VantaDB::new(None).unwrap();
+    db.put(make_put("persist_ns", "k1", "data1")).unwrap();
+    db.put(make_put("persist_ns", "k2", "data2")).unwrap();
+
+    // Save to IDB
+    db.save_idb().await.unwrap();
+
+    // Load into a new DB
+    let db2 = VantaDB::new(None).unwrap();
+    db2.load_idb().await.unwrap();
+
+    // Verify records survived
+    let result1 = db2.get("persist_ns", "k1").unwrap();
+    assert!(!result1.is_null());
+    assert_eq!(record_payload(&result1), "data1");
+
+    let result2 = db2.get("persist_ns", "k2").unwrap();
+    assert!(!result2.is_null());
+    assert_eq!(record_payload(&result2), "data2");
+
+    // Clean up IDB state
+    db2.delete_idb().await.unwrap();
+}
+
+#[wasm_bindgen_test]
+async fn test_wasm_persistence_roundtrip_empty() {
+    if !try_idb().await {
+        return;
+    }
+
+    // Save and load an empty database — must not error.
+    let db = VantaDB::new(None).unwrap();
+    db.save_idb().await.unwrap();
+
+    let db2 = VantaDB::new(None).unwrap();
+    db2.load_idb().await.unwrap();
+
+    // No state persisted, so get returns null.
+    let result = db2.get("persist_empty", "anything").unwrap();
+    assert!(result.is_null());
+
+    db2.delete_idb().await.unwrap();
+}
+
+// ── OPFS Worker (OpfsWorker) Tests ─────────────────────────────────
+// These test the OpfsWorker message handler directly (not the
+// MessageChannel transport, which requires the JS opfs_bridge.js module).
+
+#[wasm_bindgen_test]
+#[cfg(feature = "opfs")]
+async fn test_worker_init() {
+    let mut worker = OpfsWorker::new();
+    let resp = worker
+        .handle(WorkerRequest::Init {
+            name: "vantadb_worker_test".into(),
+        })
+        .await;
+    assert!(matches!(resp, WorkerResponse::Initialized));
+}
+
+#[wasm_bindgen_test]
+#[cfg(feature = "opfs")]
+async fn test_worker_write_read_cycle() {
+    let mut worker = OpfsWorker::new();
+    worker
+        .handle(WorkerRequest::Init {
+            name: "vantadb_worker_rw".into(),
+        })
+        .await;
+    let path = "worker_rw.bin".to_string();
+
+    // Write
+    let resp = worker
+        .handle(WorkerRequest::Write {
+            path: path.clone(),
+            data: b"worker data".to_vec(),
+        })
+        .await;
+    assert!(matches!(resp, WorkerResponse::Written));
+
+    // Read back
+    let resp = worker
+        .handle(WorkerRequest::Read { path: path.clone() })
+        .await;
+    match resp {
+        WorkerResponse::ReadResult { data } => {
+            assert_eq!(data, Some(b"worker data".to_vec()));
+        }
+        other => panic!("expected ReadResult, got {:?}", other),
+    }
+
+    // Cleanup
+    worker
+        .handle(WorkerRequest::Delete { path: path.clone() })
+        .await;
+}
+
+#[wasm_bindgen_test]
+#[cfg(feature = "opfs")]
+async fn test_worker_append() {
+    let mut worker = OpfsWorker::new();
+    worker
+        .handle(WorkerRequest::Init {
+            name: "vantadb_worker_append".into(),
+        })
+        .await;
+    let path = "worker_append.bin".to_string();
+
+    // Write initial data
+    worker
+        .handle(WorkerRequest::Write {
+            path: path.clone(),
+            data: b"base ".to_vec(),
+        })
+        .await;
+
+    // Append
+    let resp = worker
+        .handle(WorkerRequest::Append {
+            path: path.clone(),
+            data: b"appended".to_vec(),
+        })
+        .await;
+    assert!(matches!(resp, WorkerResponse::Appended));
+
+    // Read — write_file adds CRC, then append adds raw data after CRC.
+    // read_file will fail CRC check and return raw combined content.
+    let resp = worker
+        .handle(WorkerRequest::Read { path: path.clone() })
+        .await;
+    match resp {
+        WorkerResponse::ReadResult { data } => {
+            let raw = data.expect("file should exist");
+            // Must contain both parts due to append semantics
+            assert!(
+                String::from_utf8_lossy(&raw).contains("base"),
+                "raw content should contain 'base'"
+            );
+            assert!(
+                String::from_utf8_lossy(&raw).contains("appended"),
+                "raw content should contain 'appended'"
+            );
+        }
+        other => panic!("expected ReadResult, got {:?}", other),
+    }
+
+    worker
+        .handle(WorkerRequest::Delete { path: path.clone() })
+        .await;
+}
+
+#[wasm_bindgen_test]
+#[cfg(feature = "opfs")]
+async fn test_worker_delete() {
+    let mut worker = OpfsWorker::new();
+    worker
+        .handle(WorkerRequest::Init {
+            name: "vantadb_worker_del".into(),
+        })
+        .await;
+    let path = "worker_del.bin".to_string();
+
+    // Write then delete
+    worker
+        .handle(WorkerRequest::Write {
+            path: path.clone(),
+            data: b"delete me".to_vec(),
+        })
+        .await;
+    let resp = worker
+        .handle(WorkerRequest::Delete { path: path.clone() })
+        .await;
+    assert!(matches!(resp, WorkerResponse::Deleted));
+
+    // Read should return None
+    let resp = worker
+        .handle(WorkerRequest::Read { path: path.clone() })
+        .await;
+    match resp {
+        WorkerResponse::ReadResult { data } => assert!(data.is_none()),
+        other => panic!("expected ReadResult(None), got {:?}", other),
+    }
+}
+
+#[wasm_bindgen_test]
+#[cfg(feature = "opfs")]
+async fn test_worker_not_initialized_error() {
+    let mut worker = OpfsWorker::new();
+
+    // Read without init
+    let resp = worker
+        .handle(WorkerRequest::Read {
+            path: "no_init.bin".into(),
+        })
+        .await;
+    match resp {
+        WorkerResponse::Error { message } => {
+            assert!(
+                message.contains("not initialized"),
+                "error should mention not initialized: {}",
+                message
+            );
+        }
+        other => panic!("expected Error, got {:?}", other),
+    }
+
+    // Write without init
+    let resp = worker
+        .handle(WorkerRequest::Write {
+            path: "no_init.bin".into(),
+            data: vec![],
+        })
+        .await;
+    match resp {
+        WorkerResponse::Error { message } => {
+            assert!(message.contains("not initialized"));
+        }
+        other => panic!("expected Error, got {:?}", other),
+    }
+
+    // Append without init
+    let resp = worker
+        .handle(WorkerRequest::Append {
+            path: "no_init.bin".into(),
+            data: vec![],
+        })
+        .await;
+    match resp {
+        WorkerResponse::Error { message } => {
+            assert!(message.contains("not initialized"));
+        }
+        other => panic!("expected Error, got {:?}", other),
+    }
+
+    // Delete without init
+    let resp = worker
+        .handle(WorkerRequest::Delete {
+            path: "no_init.bin".into(),
+        })
+        .await;
+    match resp {
+        WorkerResponse::Error { message } => {
+            assert!(message.contains("not initialized"));
+        }
+        other => panic!("expected Error, got {:?}", other),
+    }
+}
+
+// ── Crash Consistency Tests (CRC & atomic-write) ────────────────────
+
+#[wasm_bindgen_test]
+async fn test_crc_valid_roundtrip() {
+    let storage = match try_opfs("vantadb_test_crc_valid").await {
+        Some(s) => s,
+        None => return,
+    };
+
+    // write_file appends CRC-32 footer automatically
+    storage
+        .write_file("crc_valid.bin", b"crc test data")
+        .await
+        .unwrap();
+
+    // read_file strips the CRC footer and returns clean data
+    let read_back = storage
+        .read_file("crc_valid.bin")
+        .await
+        .unwrap()
+        .expect("file should exist");
+    assert_eq!(read_back, b"crc test data");
+
+    storage.delete_file("crc_valid.bin").await.unwrap();
+}
+
+#[wasm_bindgen_test]
+async fn test_crc_no_footer_backward_compat() {
+    let storage = match try_opfs("vantadb_test_crc_nofooter").await {
+        Some(s) => s,
+        None => return,
+    };
+
+    // Write data without CRC footer via OpfsFile directly
+    let file = OpfsFile::open(storage.dir_handle(), "crc_no_footer.bin", true)
+        .await
+        .unwrap()
+        .expect("OpfsFile::open returned None with create=true");
+    file.write(b"legacy data without crc").await.unwrap();
+
+    // read_file tries CRC on last 4 bytes — it won't match (no footer
+    // was written), so it returns the full raw data for backward compat.
+    let read_back = storage
+        .read_file("crc_no_footer.bin")
+        .await
+        .unwrap()
+        .expect("file should exist");
+    assert_eq!(read_back, b"legacy data without crc");
+
+    storage.delete_file("crc_no_footer.bin").await.unwrap();
+}
+
+#[wasm_bindgen_test]
+async fn test_crc_invalid_footer_returns_raw() {
+    let storage = match try_opfs("vantadb_test_crc_invalid").await {
+        Some(s) => s,
+        None => return,
+    };
+
+    // Write data + deliberately wrong CRC footer via OpfsFile
+    let file = OpfsFile::open(storage.dir_handle(), "crc_fake.bin", true)
+        .await
+        .unwrap()
+        .expect("OpfsFile::open returned None with create=true");
+    let mut corrupted = b"real data".to_vec();
+    corrupted.extend_from_slice(&0xDEADBEEFu32.to_le_bytes()); // wrong CRC
+    file.write(&corrupted).await.unwrap();
+
+    // read_file checks CRC — DEADBEEF won't match crc32(b"real data"),
+    // so raw data (including fake footer) is returned for backward compat.
+    let read_back = storage
+        .read_file("crc_fake.bin")
+        .await
+        .unwrap()
+        .expect("file should exist");
+    assert_eq!(read_back, corrupted);
+
+    storage.delete_file("crc_fake.bin").await.unwrap();
+}
+
+#[wasm_bindgen_test]
+async fn test_crc_tmp_file_cleanup() {
+    let storage = match try_opfs("vantadb_test_crc_tmp").await {
+        Some(s) => s,
+        None => return,
+    };
+
+    // write_file writes to a .tmp file then renames atomically
+    storage
+        .write_file("crc_tmp_clean.bin", b"tmp cleanup test")
+        .await
+        .unwrap();
+
+    // The .tmp file should NOT exist after write_file completes
+    let tmp_result = storage.read_file("crc_tmp_clean.bin.tmp").await.unwrap();
+    assert!(
+        tmp_result.is_none(),
+        "temp file should be cleaned up after atomic write"
+    );
+
+    // The target file should be readable with correct data
+    let data = storage
+        .read_file("crc_tmp_clean.bin")
+        .await
+        .unwrap()
+        .expect("target file should exist");
+    assert_eq!(data, b"tmp cleanup test");
+
+    storage.delete_file("crc_tmp_clean.bin").await.unwrap();
 }

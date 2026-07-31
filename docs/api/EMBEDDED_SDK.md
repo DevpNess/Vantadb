@@ -3,7 +3,7 @@ title: VantaEmbedded SDK Reference
 type: api
 status: active
 tags: [vantadb, api]
-last_reviewed: 2026-07-01
+last_reviewed: 2026-07-21
 aliases: []
 ---
 
@@ -94,7 +94,7 @@ pub struct VantaMemoryRecord {
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
     pub version: u64,
-    pub node_id: u64,
+    pub node_id: u128,
     pub vector: Option<Vec<f32>>,
     pub expires_at_ms: Option<u64>,
 }
@@ -107,12 +107,12 @@ Low-level operations on the node-graph model (numeric node IDs, edges, graph tra
 | Method | Description |
 |--------|-------------|
 | `insert_node(input: VantaNodeInput)` | Insert a graph node with content, vector, and fields |
-| `get_node(id: u64)` | Retrieve a node by numeric ID. Returns `Option<VantaNodeRecord>` |
+| `get_node(id: u128)` | Retrieve a node by numeric ID. Returns `Option<VantaNodeRecord>` |
 | `delete_node(id, reason)` | Delete a node with auditable reason (tombstone) |
 | `add_edge(source_id, target_id, label, weight)` | Add a directed edge between two nodes |
-| `graph_bfs(roots, max_depth)` | BFS traversal. Returns `Vec<u64>` |
-| `graph_dfs(roots, max_depth)` | DFS traversal. Returns `Vec<u64>` |
-| `graph_topological_sort(roots)` | Topological sort. Returns `Vec<u64>` |
+| `graph_bfs(roots, max_depth)` | BFS traversal. Returns `Vec<u128>` |
+| `graph_dfs(roots, max_depth)` | DFS traversal. Returns `Vec<u128>` |
+| `graph_topological_sort(roots)` | Topological sort. Returns `Vec<u128>` |
 | `graph_is_dag(roots)` | Check if subgraph is a DAG. Returns `bool` |
 | `search_vector(vector, top_k)` | Pure [[hnsw\|HNSW]] vector search. Returns `Vec<VantaSearchHit>` |
 | `query(iql_query)` | Execute IQL query string. Returns `VantaQueryResult` |
@@ -121,7 +121,7 @@ Low-level operations on the node-graph model (numeric node IDs, edges, graph tra
 
 ```rust
 pub struct VantaNodeInput {
-    pub id: u64,
+    pub id: u128,
     pub content: Option<String>,
     pub vector: Option<Vec<f32>>,
     pub fields: VantaFields,  // BTreeMap<String, VantaValue>
@@ -132,7 +132,7 @@ pub struct VantaNodeInput {
 
 ```rust
 pub struct VantaNodeRecord {
-    pub id: u64,
+    pub id: u128,
     pub fields: VantaFields,
     pub vector: Option<Vec<f32>>,
     pub vector_dimensions: usize,
@@ -242,7 +242,7 @@ pub struct VantaMemorySearchHit {
 
 ```rust
 pub struct VantaEdgeRecord {
-    pub target: u64,
+    pub target: u128,
     pub label: String,
     pub weight: f32,
 }
@@ -271,10 +271,10 @@ pub enum VantaQueryResult {
     Write {
         affected_nodes: u64,
         message: String,
-        node_id: Option<u64>,
+        node_id: Option<u128>,
     },
     StaleContext {
-        node_id: u64,
+        node_id: u128,
     },
 }
 ```
@@ -415,8 +415,8 @@ pub struct VantaTextIndexRepairReport {
 
 All fallible methods return `Result<T, VantaError>` where `VantaError` is an enum covering:
 
-- `VantaError::NodeNotFound(u64)` — node ID not found
-- `VantaError::DuplicateNode(u64)` — duplicate node ID on insert
+- `VantaError::NodeNotFound(u128)` — node ID not found
+- `VantaError::DuplicateNode(u128)` — duplicate node ID on insert
 - `VantaError::DimensionMismatch { expected: usize, got: usize }` — vector dimension mismatch
 - `VantaError::WalError(String)` — WAL operation failure
 - `VantaError::WALVersionMismatch { expected: u32, found: u32, hint: String }` — incompatible WAL version

@@ -8,10 +8,13 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Result, VantaError};
 use crate::node::UnifiedNode;
 
+/// Current WAL format version.
+pub const WAL_FORMAT_VERSION: u16 = 1;
+
 /// Tracks the postcard wire format version used for WAL record serialization.
 /// Increment this when upgrading postcard to a potentially incompatible version.
 /// Stored in VantaHeader.schema_version for forward-compatibility detection.
-pub(crate) const WAL_POSTCARD_VERSION: u16 = 1;
+pub const WAL_POSTCARD_VERSION: u16 = 1;
 
 const KIB: usize = 1024;
 use crc32c::crc32c; // ← Import specific function to avoid namespace conflict
@@ -125,18 +128,22 @@ impl WalHeader {
         }
 
         let base = crate::binary_header::VantaHeader::deserialize(&bytes[0..16])?;
-        if &base.magic != b"VWAL" {
-            return Err(VantaError::IncompatibleFormat {
-                expected_magic: *b"VWAL",
-                expected_version: 1,
-                found_magic: base.magic,
-                found_version: base.format_version,
+
+        // Range-based compatibility check: accepts any format_version ≤ WAL_FORMAT_VERSION
+        // with matching magic. Future-format files (version > current) are rejected;
+        // older files with matching magic are accepted for forward-compatible reads.
+        base.validate_compat(*b"VWAL", WAL_FORMAT_VERSION, "WAL format")?;
+
+        // Version 0 WAL was never a valid format — reject explicitly
+        if base.format_version < 1 {
+            return Err(VantaError::WALVersionMismatch {
+                expected: WAL_FORMAT_VERSION as u32,
+                found: base.format_version as u32,
                 hint: "Delete WAL dir or run dump/restore before upgrading.".to_string(),
             });
         }
 
         let crc = u32::from_le_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
-
         let header = Self { base, crc };
 
         let computed_crc = header.compute_crc();
@@ -145,14 +152,6 @@ impl WalHeader {
                 "WAL header CRC mismatch: stored={:#x}, computed={:#x}",
                 crc, computed_crc
             )));
-        }
-
-        if header.base.format_version < 1 {
-            return Err(VantaError::WALVersionMismatch {
-                expected: 1,
-                found: header.base.format_version as u32,
-                hint: "Delete WAL dir or run dump/restore before upgrading.".to_string(),
-            });
         }
 
         let recorded_pc = header.postcard_version();
@@ -186,6 +185,8 @@ pub struct WalWriter {
     records_since_sync: u64,
     /// If `Some(N)`, auto-sync after N records when sync_mode is Periodic.
     flush_threshold: Option<usize>,
+    /// Maximum segment size in bytes before auto-rotation (default: 256MB).
+    max_segment_size: u64,
 }
 
 impl WalWriter {
@@ -213,14 +214,11 @@ impl WalWriter {
             .open(&path)?;
 
         let file_len = file.metadata()?.len();
-        let bytes_written;
-        let mut record_count = 0u64;
-
-        if file_len == 0 {
-            let header = WalHeader::new(1);
+        let (bytes_written, record_count) = if file_len == 0 {
+            let header = WalHeader::new(WAL_FORMAT_VERSION as u32);
             file.write_all(&header.serialize())?;
             file.flush()?;
-            bytes_written = WalHeader::SIZE as u64;
+            (WalHeader::SIZE as u64, 0u64)
         } else {
             // Read the existing header
             let mut header_bytes = [0u8; WalHeader::SIZE];
@@ -228,70 +226,21 @@ impl WalWriter {
             file.read_exact(&mut header_bytes)?;
             let _header = WalHeader::deserialize(&header_bytes)?;
 
-            // Scan to count valid records and detect tail or mid-file corruption (Scan-Forward Auto-healing)
-            let mut valid_bytes_limit = WalHeader::SIZE as u64;
-            {
-                let mut file_handle = File::open(&path)?;
-                let mut current_offset = WalHeader::SIZE as u64;
+            let (valid_end, count) = recover_valid_records(&path, file_len)?;
 
-                loop {
-                    if current_offset >= file_len {
-                        break;
-                    }
-                    if file_handle.seek(SeekFrom::Start(current_offset)).is_err() {
-                        break;
-                    }
-                    let mut len_buf = [0u8; 4];
-                    if file_handle.read_exact(&mut len_buf).is_err() {
-                        break;
-                    }
-                    let len = u32::from_le_bytes(len_buf) as u64;
-
-                    let is_valid = check_record_at(&mut file_handle, current_offset, file_len);
-
-                    if is_valid {
-                        record_count += 1;
-                        current_offset += 4 + len + 4;
-                        valid_bytes_limit = current_offset;
-                    } else {
-                        // Entering Scan-Forward mode (scan forward byte by byte)
-                        warn!(
-                            path = %path.display(),
-                            offset = current_offset,
-                            "Corrupt record detected in WAL. Entering Scan-Forward mode to locate next valid transaction..."
-                        );
-
-                        if let Some(found) =
-                            scan_forward_valid(&mut file_handle, file_len, current_offset)
-                        {
-                            warn!(
-                                path = %path.display(),
-                                skipped_corrupt_bytes = found - current_offset,
-                                recovered_offset = found,
-                                "Successfully bypassed corrupt segment and recovered next transaction."
-                            );
-                            current_offset = found;
-                        } else {
-                            // No more valid records in the file. Corruption is tail/truncated.
-                            break;
-                        }
-                    }
-                }
-            }
-
-            if file_len > valid_bytes_limit {
+            if file_len > valid_end {
                 warn!(
                     path = %path.display(),
                     expected_len = file_len,
-                    valid_len = valid_bytes_limit,
+                    valid_len = valid_end,
                     "Truncating corrupt or incomplete records at the end of WAL"
                 );
-                file.set_len(valid_bytes_limit)?;
+                file.set_len(valid_end)?;
             }
 
-            bytes_written = valid_bytes_limit;
-            file.seek(SeekFrom::Start(bytes_written))?;
-        }
+            file.seek(SeekFrom::Start(valid_end))?;
+            (valid_end, count as u64)
+        };
 
         let buffer_size = buffer_size.clamp(KIB, 32 * 1024 * KIB);
 
@@ -303,6 +252,7 @@ impl WalWriter {
             sync_mode,
             records_since_sync: 0,
             flush_threshold,
+            max_segment_size: 256 * 1024 * 1024,
         })
     }
 
@@ -328,6 +278,7 @@ impl WalWriter {
         self.records_since_sync += 1;
 
         self.maybe_sync()?;
+        self.try_auto_rotate()?;
         Ok(())
     }
 
@@ -362,15 +313,24 @@ impl WalWriter {
         self.records_since_sync += records.len() as u64;
 
         self.maybe_sync()?;
+        self.try_auto_rotate()?;
         Ok(())
     }
 
     /// Conditionally sync based on sync mode and flush threshold.
+    /// Default threshold for `Periodic` when none is configured: 1 (sync every write)
+    /// to avoid losing more than one record on crash.
+    const DEFAULT_PERIODIC_THRESHOLD: u64 = 1;
+
     fn maybe_sync(&mut self) -> Result<()> {
         if self.sync_mode == crate::config::SyncMode::Always {
             self.sync()?;
-        } else if let Some(threshold) = self.flush_threshold {
-            if self.records_since_sync >= threshold as u64 {
+        } else {
+            let threshold = self
+                .flush_threshold
+                .map(|t| t as u64)
+                .unwrap_or(Self::DEFAULT_PERIODIC_THRESHOLD);
+            if self.records_since_sync >= threshold {
                 self.sync()?;
             }
         }
@@ -425,6 +385,58 @@ impl WalWriter {
 
         Self::open(&old_path, sync_mode)
     }
+
+    /// If bytes_written exceeds max_segment_size, flush + archive current
+    /// segment and start a fresh WAL at the same path.
+    ///
+    /// Returns `Ok(true)` if rotation occurred, `Ok(false)` otherwise.
+    fn try_auto_rotate(&mut self) -> Result<bool> {
+        if self.bytes_written < self.max_segment_size {
+            return Ok(false);
+        }
+
+        // Flush and sync current content
+        self.writer.flush()?;
+        self.writer.get_ref().sync_data()?;
+
+        let old_path = self.path.clone();
+        let now = web_time::SystemTime::now()
+            .duration_since(web_time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let archive_name = format!(
+            "{}.{}",
+            old_path.file_name().unwrap_or_default().to_string_lossy(),
+            now
+        );
+        let archive_path = old_path.with_file_name(&archive_name);
+
+        // Remove existing archive if present, then rename current WAL
+        if archive_path.exists() {
+            std::fs::remove_file(&archive_path)?;
+        }
+        std::fs::rename(&old_path, &archive_path)?;
+
+        // Open fresh WAL file at original path and write a new header
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&old_path)?;
+
+        let header = WalHeader::new(WAL_FORMAT_VERSION as u32);
+        file.write_all(&header.serialize())?;
+
+        // Reset writer and counters with the same buffer capacity
+        let capacity = self.writer.capacity();
+        self.writer = BufWriter::with_capacity(capacity, file);
+        self.bytes_written = WalHeader::SIZE as u64;
+        self.record_count = 0;
+        self.records_since_sync = 0;
+
+        Ok(true)
+    }
 }
 
 // ─── Scan-Forward Helpers ─────────────────────────────────
@@ -474,6 +486,67 @@ fn scan_forward_valid<R: Read + Seek>(
         scan_pos += 1;
     }
     None
+}
+
+/// Try to scan forward past corruption. Logs a warning and returns the found position,
+/// or `None` if no valid record remains in the file.
+fn try_scan_forward<R: Read + Seek>(
+    reader: &mut R,
+    file_len: u64,
+    current_pos: u64,
+) -> Option<u64> {
+    let found = scan_forward_valid(reader, file_len, current_pos)?;
+    warn!(
+        corrupt_bytes_skipped = found - current_pos,
+        recovered_offset = found,
+        "Scan-forward bypassed corrupt bytes and recovered next transaction."
+    );
+    Some(found)
+}
+
+/// Scan an existing WAL file to find the end of valid records and count them.
+/// Handles mid-file corruption via Scan-Forward recovery. Returns `(valid_bytes_end, record_count)`.
+fn recover_valid_records(path: &Path, file_len: u64) -> Result<(u64, usize)> {
+    let mut file_handle = File::open(path)?;
+    let mut valid_bytes_limit = WalHeader::SIZE as u64;
+    let mut record_count = 0usize;
+    let mut current_offset = WalHeader::SIZE as u64;
+
+    loop {
+        if current_offset >= file_len {
+            break;
+        }
+        if file_handle.seek(SeekFrom::Start(current_offset)).is_err() {
+            break;
+        }
+        let mut len_buf = [0u8; 4];
+        if file_handle.read_exact(&mut len_buf).is_err() {
+            break;
+        }
+        let len = u32::from_le_bytes(len_buf) as u64;
+
+        let is_valid = check_record_at(&mut file_handle, current_offset, file_len);
+
+        if is_valid {
+            record_count += 1;
+            current_offset += 4 + len + 4;
+            valid_bytes_limit = current_offset;
+        } else {
+            warn!(
+                path = %path.display(),
+                offset = current_offset,
+                "Corrupt record detected in WAL. Entering Scan-Forward mode to locate next valid transaction..."
+            );
+
+            if let Some(found) = try_scan_forward(&mut file_handle, file_len, current_offset) {
+                current_offset = found;
+            } else {
+                break;
+            }
+        }
+    }
+
+    Ok((valid_bytes_limit, record_count))
 }
 
 // ─── WAL Reader ────────────────────────────────────────────
@@ -579,15 +652,9 @@ impl WalReader {
                     "WalReader detected corrupt record. Scanning forward to recover next valid transaction..."
                 );
 
-                if let Some(found) = scan_forward_valid(&mut self.reader, file_len, current_pos) {
-                    warn!(
-                        corrupt_bytes_skipped = found - current_pos,
-                        recovered_offset = found,
-                        "WalReader successfully bypassed corrupt bytes and resumed recovery."
-                    );
+                if let Some(found) = try_scan_forward(&mut self.reader, file_len, current_pos) {
                     self.reader.seek(SeekFrom::Start(found))?;
                 } else {
-                    // No more valid records in the entire file, actual end of stream
                     return Ok(None);
                 }
             }
@@ -803,5 +870,116 @@ mod tests {
         }
 
         let _ = std::fs::remove_file(&dir);
+    }
+
+    #[test]
+    fn test_auto_rotate_triggers_at_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vanta.wal");
+
+        let mut w =
+            WalWriter::open_with_buffer(&path, crate::config::SyncMode::Periodic, 4096, None)
+                .unwrap();
+        // Tiny limit — any append triggers rotation
+        w.max_segment_size = 1;
+
+        w.append(&WalRecord::Insert(UnifiedNode::new(42))).unwrap();
+        w.sync().unwrap();
+
+        // An archived segment must exist
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.file_name().to_string_lossy().contains("vanta.wal.")),
+            "Expected archived segment, got: {:?}",
+            entries
+                .iter()
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .collect::<Vec<_>>()
+        );
+
+        // bytes_written reset to header-only size
+        assert_eq!(w.bytes_written, WalHeader::SIZE as u64);
+        assert_eq!(w.record_count, 0);
+    }
+
+    #[test]
+    fn test_auto_rotate_not_before_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vanta.wal");
+
+        let mut w =
+            WalWriter::open_with_buffer(&path, crate::config::SyncMode::Periodic, 4096, None)
+                .unwrap();
+        // Default max_segment_size is 256MB — one small record won't trigger
+        w.append(&WalRecord::Insert(UnifiedNode::new(1))).unwrap();
+        w.sync().unwrap();
+
+        assert!(w.bytes_written > WalHeader::SIZE as u64);
+        assert_eq!(w.record_count, 1);
+
+        // No archived segment should exist
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert!(
+            !entries
+                .iter()
+                .any(|e| e.file_name().to_string_lossy().contains("vanta.wal.")),
+            "Unexpected archived segment found: {:?}",
+            entries
+        );
+    }
+
+    #[test]
+    fn test_auto_rotate_preserves_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vanta.wal");
+
+        let mut w =
+            WalWriter::open_with_buffer(&path, crate::config::SyncMode::Periodic, 4096, None)
+                .unwrap();
+        // Each 300-float record serializes to ~1260 bytes. With max_segment_size=3700,
+        // 3 records fill ~3780 bytes exceeding the limit at the 3rd append. This guarantees
+        // the archive contains exactly the 3 original records written before rotation.
+        w.max_segment_size = 3700;
+
+        let records = vec![
+            WalRecord::Insert(UnifiedNode::with_vector(1, vec![0.0; 300])),
+            WalRecord::Insert(UnifiedNode::with_vector(2, vec![0.0; 300])),
+            WalRecord::Insert(UnifiedNode::with_vector(3, vec![0.0; 300])),
+        ];
+        for rec in &records {
+            w.append(rec).unwrap();
+        }
+        w.sync().unwrap();
+
+        // Find the archived segment
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        let archive = entries
+            .iter()
+            .find(|e| e.file_name().to_string_lossy().contains("vanta.wal."))
+            .expect("Expected archived segment");
+        let archive_path = archive.path();
+
+        // Read the archived segment and verify records
+        let mut reader = WalReader::open(&archive_path).unwrap();
+        let mut recovered: Vec<WalRecord> = Vec::new();
+        while let Some(rec) = reader.next_record().unwrap() {
+            recovered.push(rec);
+        }
+
+        assert_eq!(recovered.len(), 3, "Archived segment should have 3 records");
+        assert!(matches!(&recovered[0], WalRecord::Insert(n) if n.id == 1));
+        assert!(matches!(&recovered[1], WalRecord::Insert(n) if n.id == 2));
+        assert!(matches!(&recovered[2], WalRecord::Insert(n) if n.id == 3));
     }
 }

@@ -9,7 +9,7 @@ aliases: []
 
 # VantaDB 5-Minute Quickstart
 
-This quickstart validates the current v0.1.x MVP boundary from a clean local
+This quickstart validates the current v0.4.x MVP boundary from a clean local
 checkout. It uses the embedded CLI for operational flows and the source-installed
 Python binding for vector, text, and hybrid memory search.
 
@@ -19,7 +19,7 @@ required.
 ## 1. Prerequisites
 
 - Rust stable toolchain
-- Python 3.8 or newer
+- Python 3.11 or newer
 - `pip`
 - Platform build tools needed by Rust dependencies
 

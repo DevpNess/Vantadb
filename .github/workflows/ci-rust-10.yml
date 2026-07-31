@@ -81,7 +81,9 @@ jobs:
           swap-mb: 4096
 
       - name: Clippy Lints (core)
-        run: cargo clippy --workspace --all-targets --all-features --exclude vantadb-wasm -- -D warnings
+        # CATEGORY: EXPERIMENTAL — excludes experimental crates from blocking lint checks.
+        # Use --exclude vantadb-wasm --exclude vantadb-server --exclude vantadb-mcp.
+        run: cargo clippy --workspace --all-targets --all-features --exclude vantadb-wasm --exclude vantadb-server --exclude vantadb-mcp -- -D warnings
 
   test:
     name: Tests (Linux)
@@ -139,7 +141,8 @@ jobs:
         run: cargo check
 
       - name: Clippy (Windows)
-        run: cargo clippy --workspace --all-targets --all-features --exclude vantadb-wasm -- -D warnings
+        # CATEGORY: EXPERIMENTAL — excludes experimental crates.
+        run: cargo clippy --workspace --all-targets --all-features --exclude vantadb-wasm --exclude vantadb-server --exclude vantadb-mcp -- -D warnings
 
       - name: Run quick integrity tests (Windows)
         shell: pwsh
@@ -170,7 +173,8 @@ jobs:
         run: cargo check
 
       - name: Clippy (macOS)
-        run: cargo clippy --workspace --all-targets --all-features --exclude vantadb-wasm -- -D warnings
+        # CATEGORY: EXPERIMENTAL — excludes experimental crates.
+        run: cargo clippy --workspace --all-targets --all-features --exclude vantadb-wasm --exclude vantadb-server --exclude vantadb-mcp -- -D warnings
 
       - name: Run tests (Audit profile, core)
         shell: bash
@@ -196,7 +200,9 @@ jobs:
   minimal-versions:
     name: Minimal Versions Check (-Zminimal-versions)
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
+    # CATEGORY: EXPERIMENTAL — nightly-only -Zminimal-versions is unstable.
+    # Failure does not indicate a regression in default builds.
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
@@ -239,11 +245,15 @@ jobs:
 
       - name: Run tests with coverage
         timeout-minutes: 25
+        # CATEGORY: EXPERIMENTAL — --exclude flags skip experimental crates (server, mcp, wasm).
         run: |
           cargo llvm-cov nextest \
             --profile audit \
             --workspace \
             --features "cli,arrow,tls,opentelemetry" \
+            --exclude vantadb-wasm \
+            --exclude vantadb-server \
+            --exclude vantadb-mcp \
             --lcov --output-path lcov.info \
             --ignore-filename-regex '(tests/|benches/|packages/experimental|crash_injection)' \
             2>&1
@@ -251,7 +261,7 @@ jobs:
           cargo llvm-cov report \
             --ignore-filename-regex '(tests/|benches/|packages/experimental)'
 
-      - name: Enforce coverage threshold (>=59%)
+      - name: Enforce coverage threshold (>=70%)
         shell: bash
         run: |
           cargo llvm-cov report --json \
@@ -266,7 +276,7 @@ jobs:
           totals = data[0].get('totals', {})
           lines = totals.get('lines', {})
           pct = lines.get('percent', 0.0)
-          ok = pct >= 59.0
+          ok = pct >= 80.0
           print(f'Line coverage: {pct:.1f}% {\"✅\" if ok else \"❌\"}')
           sys.exit(0 if ok else 1)
           "
@@ -277,6 +287,53 @@ jobs:
           name: coverage-lcov
           path: lcov.info
           if-no-files-found: warn
+
+  wasm-test:
+    name: WASM (wasm-pack browser tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # CATEGORY: BEST-EFFORT — WASM is Tier 3 Experimental.
+    # Browser tests require wasm-pack + Chrome. Failures are non-blocking.
+    continue-on-error: true
+    if: ${{ github.event_name == 'push' && contains(github.event.head_commit.modified, 'vantadb-wasm/') }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install wasm-pack
+        run: cargo install wasm-pack
+
+      - name: Install wasm target
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: Run browser tests (Chrome)
+        working-directory: vantadb-wasm
+        run: wasm-pack test --chrome --headless
+
+  experimental-check:
+    name: Experimental Crates Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # CATEGORY: EXPERIMENTAL — server, MCP, WASM, and adapter crates. These
+    # crates are not in workspace default-members; this job checks them so
+    # regressions surface in CI. Must pass before merge.
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/rust-setup
+        with:
+          install-system-deps: true
+          swap-mb: 4096
+
+      - name: Check experimental server + MCP + WASM crates
+        run: cargo check -p vantadb-server -p vantadb-mcp -p vantadb-wasm
+
+      - name: Check experimental adapter crates
+        # providers/* are intentionally NOT workspace members (MSVC linker
+        # crash on Windows) — check them individually via --manifest-path.
+        run: |
+          cargo check --manifest-path providers/openai/Cargo.toml
+          cargo check --manifest-path providers/ollama/Cargo.toml
+          cargo check --manifest-path providers/litellm/Cargo.toml
 
   audit:
     name: Security Audit
@@ -297,7 +354,8 @@ jobs:
           tool: cargo-audit
 
       - name: Security Audit
-        run: cargo audit --ignore RUSTSEC-2026-0176 --ignore RUSTSEC-2026-0177
+        # Ignores managed in .cargo/audit.toml + deny.toml [advisories]
+        run: cargo audit
 
   miri:
     name: Miri (UB Detection)
@@ -359,6 +417,8 @@ jobs:
     name: ASan (AddressSanitizer)
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    # CATEGORY: BEST-EFFORT — nightly ASan can produce false positives.
+    # Failures are reviewed manually. Does not gate releases.
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
@@ -374,8 +434,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libclang-dev clang librocksdb-dev
 
+      # CATEGORY: BEST-EFFORT — job-level continue-on-error covers this
       - name: Test with AddressSanitizer
-        continue-on-error: true
         run: |
           cargo +nightly test \
             --target x86_64-unknown-linux-gnu \
@@ -391,6 +451,8 @@ jobs:
     name: TSan (ThreadSanitizer)
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # CATEGORY: BEST-EFFORT — nightly TSan is unstable.
+    # Failures are reviewed manually. Does not gate releases.
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
@@ -405,8 +467,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libclang-dev clang librocksdb-dev
 
+      # CATEGORY: BEST-EFFORT — job-level continue-on-error covers this
       - name: Test with ThreadSanitizer
-        continue-on-error: true
         run: |
           cargo +nightly test \
             --target x86_64-unknown-linux-gnu \

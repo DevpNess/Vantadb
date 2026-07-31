@@ -19,7 +19,7 @@ use console::style;
 use std::path::Path;
 use std::time::Instant;
 use tempfile::TempDir;
-use vantadb::index::{CPIndex, HnswConfig, IndexBackend, VectorRepresentations};
+use vantadb::index::{CPIndex, HnswConfig, IndexBackend, IndexType, VectorRepresentations};
 use vantadb::node::{DistanceMetric, FilterBitset};
 
 #[path = "../common/mod.rs"]
@@ -206,6 +206,8 @@ fn sift1m_competitive_benchmark() {
         ml: 1.0 / (16_f64).ln(),
         distance_metric: DistanceMetric::Cosine,
         flat_threshold: None,
+        index_type: IndexType::Hnsw,
+        auto_tune: false,
     };
     let high_recall_cos = HnswConfig {
         m: 32,
@@ -215,6 +217,8 @@ fn sift1m_competitive_benchmark() {
         ml: 1.0 / (32_f64).ln(),
         distance_metric: DistanceMetric::Cosine,
         flat_threshold: None,
+        index_type: IndexType::Hnsw,
+        auto_tune: false,
     };
     let balanced_l2 = HnswConfig {
         m: 16,
@@ -224,6 +228,8 @@ fn sift1m_competitive_benchmark() {
         ml: 1.0 / (16_f64).ln(),
         distance_metric: DistanceMetric::Euclidean,
         flat_threshold: None,
+        index_type: IndexType::Hnsw,
+        auto_tune: false,
     };
     let high_recall_l2 = HnswConfig {
         m: 32,
@@ -233,6 +239,8 @@ fn sift1m_competitive_benchmark() {
         ml: 1.0 / (32_f64).ln(),
         distance_metric: DistanceMetric::Euclidean,
         flat_threshold: None,
+        index_type: IndexType::Hnsw,
+        auto_tune: false,
     };
 
     for &scale in &[10_000usize, 100_000] {

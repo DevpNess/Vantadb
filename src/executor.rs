@@ -183,6 +183,11 @@ impl<'a> Executor<'a> {
         }
 
         match statement {
+            Statement::Select(select) => {
+                let plan = select.into_logical_plan();
+                let nodes = self.execute_plan(plan)?;
+                Ok(ExecutionResult::Read(nodes))
+            }
             Statement::Query(query) => {
                 let plan = query.into_logical_plan();
                 let nodes = self.execute_plan(plan)?;
@@ -228,11 +233,19 @@ impl<'a> Executor<'a> {
                 #[cfg(feature = "remote-inference")]
                 if insert.vector.is_none() {
                     if let Some(crate::node::FieldValue::String(text)) = insert.fields.get("text") {
-                        let llm = crate::llm::LlmClient::new();
-                        // Request vectors to local Ollama inference bridge
-                        if let Ok(vec) = llm.generate_embedding(text) {
-                            node.vector = VectorRepresentations::Full(vec);
-                            node.flags.set(crate::node::NodeFlags::HAS_VECTOR);
+                        if !text.trim().is_empty() {
+                            let provider = crate::llm::get_embedding_provider();
+                            match provider.embed(text) {
+                                Ok(vec) => {
+                                    node.vector = VectorRepresentations::Full(vec);
+                                    node.flags.set(crate::node::NodeFlags::HAS_VECTOR);
+                                }
+                                Err(e) => tracing::warn!(
+                                    "Auto-embedding failed for INSERT node {}: {}",
+                                    insert.node_id,
+                                    e
+                                ),
+                            }
                         }
                     }
                 }
@@ -313,10 +326,11 @@ impl<'a> Executor<'a> {
                     }
                 }
 
+                let label_id = self.storage.intern_label(&relate.label);
                 if let Some(w) = relate.weight {
-                    node.add_weighted_edge(relate.target_id, relate.label, w);
+                    node.add_weighted_edge(relate.target_id, label_id, w);
                 } else {
-                    node.add_edge(relate.target_id, relate.label);
+                    node.add_edge(relate.target_id, label_id);
                 }
                 self.storage.insert(&node)?;
                 Ok(ExecutionResult::Write {
@@ -351,16 +365,24 @@ impl<'a> Executor<'a> {
 
                 // Embed directly via LLM since it's a message
                 #[cfg(feature = "remote-inference")]
-                {
-                    let llm = crate::llm::LlmClient::new();
-                    if let Ok(vec) = llm.generate_embedding(&msg.content) {
-                        node.vector = VectorRepresentations::Full(vec);
-                        node.flags.set(crate::node::NodeFlags::HAS_VECTOR);
+                if !msg.content.trim().is_empty() {
+                    let provider = crate::llm::get_embedding_provider();
+                    match provider.embed(&msg.content) {
+                        Ok(vec) => {
+                            node.vector = VectorRepresentations::Full(vec);
+                            node.flags.set(crate::node::NodeFlags::HAS_VECTOR);
+                        }
+                        Err(e) => tracing::warn!(
+                            "Auto-embedding failed for InsertMessage {}: {}",
+                            msg_id,
+                            e
+                        ),
                     }
                 }
 
                 // Now create relationship: MESSAGE -> belongs_to -> THREAD
-                node.add_edge(msg.thread_id, "belongs_to_thread".to_string());
+                let belongs_to_id = self.storage.intern_label("belongs_to_thread");
+                node.add_edge(msg.thread_id, belongs_to_id);
 
                 // Node is saved (Atomic write for State + Edge)
                 self.storage.insert(&node)?;
@@ -440,6 +462,8 @@ mod tests {
     use crate::backend::BackendKind;
     use crate::config::VantaConfig;
     use crate::node::FieldValue;
+    #[cfg(feature = "remote-inference")]
+    use crate::query::InsertMessageStatement;
     use crate::query::{DeleteStatement, InsertStatement, RelateStatement, UpdateStatement};
     use std::collections::BTreeMap;
     use tempfile::tempdir;
@@ -761,7 +785,8 @@ mod tests {
         let node = storage.get(50).unwrap().unwrap();
         assert_eq!(node.edges.len(), 1);
         assert_eq!(node.edges[0].target, 51);
-        assert_eq!(node.edges[0].label, "knows");
+        let knows_id = storage.intern_label("knows");
+        assert_eq!(node.edges[0].label_id, knows_id);
         assert_eq!(node.edges[0].weight, 0.9);
     }
 
@@ -801,5 +826,185 @@ mod tests {
         });
         let err = ex.execute_statement(relate).unwrap_err();
         assert!(err.to_string().contains("not found") || err.to_string().contains("Tombstone"));
+    }
+
+    // ── Auto-embedding (remote-inference feature) ──
+
+    #[cfg(feature = "remote-inference")]
+    #[test]
+    fn test_auto_embedding_graceful_degradation_on_insert() {
+        let (storage, _dir) = setup_storage();
+        let ex = Executor::new(&storage);
+
+        let mut fields = BTreeMap::new();
+        fields.insert("text".into(), FieldValue::String("hello world".into()));
+
+        let stmt = Statement::Insert(InsertStatement {
+            node_id: 100,
+            node_type: "Message".into(),
+            fields,
+            vector: None,
+        });
+
+        // No Ollama running — auto-embedding fails gracefully. Node still inserted.
+        let result = ex.execute_statement(stmt).unwrap();
+        match result {
+            ExecutionResult::Write { affected_nodes, .. } => {
+                assert_eq!(affected_nodes, 1);
+            }
+            _ => panic!("expected Write result"),
+        }
+
+        let node = storage.get(100).unwrap().unwrap();
+        // Auto-embedding failed (no Ollama), so no vector was set
+        assert!(node.vector.is_none());
+    }
+
+    #[cfg(feature = "remote-inference")]
+    #[test]
+    fn test_auto_embedding_graceful_degradation_on_insert_message() {
+        let (storage, _dir) = setup_storage();
+        let ex = Executor::new(&storage);
+
+        let stmt = Statement::InsertMessage(InsertMessageStatement {
+            thread_id: 200,
+            msg_role: "user".into(),
+            content: "hello world".into(),
+        });
+
+        // No Ollama running — auto-embedding fails gracefully. Node + edge still inserted.
+        let result = ex.execute_statement(stmt).unwrap();
+        match result {
+            ExecutionResult::Write {
+                affected_nodes,
+                message,
+                ..
+            } => {
+                assert_eq!(affected_nodes, 2);
+                assert!(message.contains("inserted"));
+            }
+            _ => panic!("expected Write result"),
+        }
+    }
+
+    #[cfg(feature = "remote-inference")]
+    #[test]
+    fn test_auto_embedding_skipped_when_vector_provided() {
+        let (storage, _dir) = setup_storage();
+        let ex = Executor::new(&storage);
+
+        let mut fields = BTreeMap::new();
+        fields.insert("text".into(), FieldValue::String("hello world".into()));
+
+        let stmt = Statement::Insert(InsertStatement {
+            node_id: 101,
+            node_type: "Message".into(),
+            fields,
+            vector: Some(vec![0.1, 0.2, 0.3]),
+        });
+
+        // Vector is explicitly provided — auto-embedding is skipped.
+        let result = ex.execute_statement(stmt).unwrap();
+        match result {
+            ExecutionResult::Write { .. } => {}
+            _ => panic!("expected Write result"),
+        }
+
+        let node = storage.get(101).unwrap().unwrap();
+        assert!(!node.vector.is_none());
+        assert!(node.flags.is_set(crate::node::NodeFlags::HAS_VECTOR));
+    }
+
+    #[cfg(feature = "remote-inference")]
+    #[test]
+    fn test_auto_embedding_skipped_on_empty_text() {
+        let (storage, _dir) = setup_storage();
+        let ex = Executor::new(&storage);
+
+        let mut fields = BTreeMap::new();
+        fields.insert("text".into(), FieldValue::String("".into()));
+        fields.insert("name".into(), FieldValue::String("no-text".into()));
+
+        let stmt = Statement::Insert(InsertStatement {
+            node_id: 110,
+            node_type: "Message".into(),
+            fields,
+            vector: None,
+        });
+
+        // Empty text — auto-embedding is skipped without calling the LLM.
+        let result = ex.execute_statement(stmt).unwrap();
+        match result {
+            ExecutionResult::Write { affected_nodes, .. } => {
+                assert_eq!(affected_nodes, 1);
+            }
+            _ => panic!("expected Write result"),
+        }
+
+        let node = storage.get(110).unwrap().unwrap();
+        assert!(
+            node.vector.is_none(),
+            "empty text should not trigger LLM call"
+        );
+        assert_eq!(
+            node.get_field("name"),
+            Some(&FieldValue::String("no-text".into()))
+        );
+    }
+
+    #[cfg(feature = "remote-inference")]
+    #[test]
+    fn test_auto_embedding_skipped_on_no_text_field() {
+        let (storage, _dir) = setup_storage();
+        let ex = Executor::new(&storage);
+
+        let mut fields = BTreeMap::new();
+        fields.insert("title".into(), FieldValue::String("hello".into()));
+
+        let stmt = Statement::Insert(InsertStatement {
+            node_id: 111,
+            node_type: "Note".into(),
+            fields,
+            vector: None,
+        });
+
+        // No "text" field — auto-embedding is skipped entirely.
+        let result = ex.execute_statement(stmt).unwrap();
+        match result {
+            ExecutionResult::Write { affected_nodes, .. } => {
+                assert_eq!(affected_nodes, 1);
+            }
+            _ => panic!("expected Write result"),
+        }
+
+        let node = storage.get(111).unwrap().unwrap();
+        assert!(node.vector.is_none());
+    }
+
+    #[cfg(feature = "remote-inference")]
+    #[test]
+    fn test_auto_embedding_skipped_on_empty_message_content() {
+        let (storage, _dir) = setup_storage();
+        let ex = Executor::new(&storage);
+
+        let stmt = Statement::InsertMessage(InsertMessageStatement {
+            thread_id: 300,
+            msg_role: "user".into(),
+            content: "".into(),
+        });
+
+        // Empty message content — auto-embedding is skipped without LLM call.
+        let result = ex.execute_statement(stmt).unwrap();
+        match result {
+            ExecutionResult::Write {
+                affected_nodes,
+                message,
+                ..
+            } => {
+                assert_eq!(affected_nodes, 2);
+                assert!(message.contains("inserted"));
+            }
+            _ => panic!("expected Write result"),
+        }
     }
 }

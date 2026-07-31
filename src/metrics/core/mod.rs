@@ -223,6 +223,13 @@ pub fn record_derived_full_scan_fallback() {
 
 // ── PERF-10: Eviction recording ──────────────────────────────
 
+/// Record the current auto-tuned ef_search value for Prometheus gauge.
+pub fn record_auto_tune_ef(ef: usize) {
+    #[cfg(not(feature = "prometheus"))]
+    let _ = ef;
+    set_gauge!(AUTO_TUNE_EF, ef);
+}
+
 /// Record an eviction cycle result: nodes evicted, scanned, bytes freed.
 pub fn record_eviction(evicted: u64, scanned: u64, bytes_freed: u64) {
     EVICTIONS_TOTAL.fetch_add(evicted, Ordering::Relaxed);
@@ -243,6 +250,21 @@ pub fn record_quantization() {
 pub fn record_promotion() {
     PROMOTED_NODES_TOTAL.fetch_add(1, Ordering::Relaxed);
     CURRENT_QUANTIZED_NODES.fetch_sub(1, Ordering::Relaxed);
+}
+
+// ── Cache warmer metrics ─────────────────────────────────────
+
+/// Snapshot cache warmer metrics into Prometheus gauges.
+/// ponytail: `#[allow(dead_code)]` — called from `CacheWarmer::metrics()` which
+/// is only called from tests; wire into a periodic tick when one exists.
+#[allow(dead_code)]
+pub(crate) fn record_cache_warmer_metrics(metrics: crate::cache_warmer::CacheWarmerMetrics) {
+    #[cfg(not(feature = "prometheus"))]
+    let _ = metrics;
+    set_gauge!(CACHE_WARMER_TRACKED_NODES, metrics.tracked_nodes);
+    set_gauge!(CACHE_WARMER_TOTAL_PAIRS, metrics.total_pairs);
+    set_gauge!(CACHE_WARMER_TOTAL_EVENTS, metrics.total_events);
+    set_gauge!(CACHE_WARMER_PREFETCH_HITS, metrics.prefetch_hits);
 }
 
 fn get_native_memory() -> Option<(u64, u64)> {

@@ -30,7 +30,6 @@
 //! | `wal-shipping` | Async WAL shipping to replicas |
 //! | `pitr` | Point-in-time recovery from WAL archives |
 //! | `async-ingestion` | Background ingestion worker pool |
-//! | `governance` | Governance policy engine |
 //! | `remote-inference` | Remote LLM inference integration |
 //!
 //! ## Quick Example
@@ -58,10 +57,13 @@
 #[cfg(feature = "encryption")]
 pub mod crypto;
 
+pub mod accumulator;
+pub mod agentic;
 pub(crate) mod backend;
 pub(crate) mod backends;
 /// Binary header format for all persisted VantaDB files.
 pub mod binary_header;
+pub(crate) mod cache_warmer;
 #[cfg(feature = "cli")]
 pub mod cli;
 #[cfg(feature = "cli")]
@@ -77,17 +79,21 @@ pub(crate) mod edge_index;
 pub mod engine;
 /// Core error types for all VantaDB operations.
 pub mod error;
+/// Eviction policies: weighted scoring and Bayesian Beta-Binomial decay.
+pub mod eviction;
 pub mod executor;
 pub mod gc;
-#[cfg(feature = "governance")]
-pub mod governance;
+pub mod gds;
 pub mod governor;
 pub mod graph;
+pub mod graphrag;
 pub mod hardware;
 pub mod index;
 pub mod integrations;
 #[cfg(feature = "remote-inference")]
 pub mod llm;
+/// LSM-tree segment types and offset packing.
+pub(crate) mod lsm;
 pub(crate) mod memory_governor;
 pub mod metadata;
 pub mod metrics;
@@ -104,6 +110,8 @@ pub mod query;
 pub(crate) mod rbac;
 pub mod sdk;
 pub mod serialization;
+/// Typed columnar storage for metadata fields (JSON Shredding).
+pub mod shred;
 pub mod sync_ext;
 
 pub(crate) mod scalar_index;
@@ -113,6 +121,8 @@ pub mod storage;
 pub(crate) mod text_index;
 #[cfg(feature = "advanced-tokenizer")]
 pub mod tokenizer;
+#[cfg(feature = "tui")]
+pub mod tui;
 pub mod utils;
 pub mod vector;
 /// Write-ahead log reader, writer, and record types.
@@ -138,21 +148,24 @@ pub mod transcript;
 pub use binary_header::VantaHeader;
 pub use engine::{EngineStats, InMemoryEngine, QueryResult, SourceType};
 pub use error::{Result, VantaError};
+pub use index::graph::VECTOR_INDEX_VERSION;
 pub use node::{
     DistanceMetric, Edge, FieldValue, NodeFlags, RelFields, UnifiedNode, VectorRepresentations,
 };
 pub use sdk::{
-    connect, VantaBm25TermContribution, VantaCapabilities, VantaEdgeRecord, VantaEmbedded,
-    VantaExportReport, VantaFields, VantaHybridFusionReport, VantaImportReport,
+    connect, BulkImportReport, VantaBm25TermContribution, VantaCapabilities, VantaEdgeRecord,
+    VantaEmbedded, VantaExportReport, VantaFields, VantaHybridFusionReport, VantaImportReport,
     VantaIndexRebuildReport, VantaMemoryInput, VantaMemoryListOptions, VantaMemoryListPage,
     VantaMemoryMetadata, VantaMemoryRecord, VantaMemorySearchHit, VantaMemorySearchRequest,
     VantaNodeInput, VantaNodeRecord, VantaOperationalMetrics, VantaQueryResult,
     VantaRuntimeProfile, VantaSearchExplanation, VantaSearchExplanationHit, VantaSearchHit,
     VantaStorageTier, VantaTextIndexAuditReport, VantaTextIndexRepairReport, VantaValue,
 };
+pub use storage::vfile::VFILE_VERSION;
 pub use storage::BackendKind;
 pub use utils::compute_confidence_friction;
 pub use wal::{WalReader, WalRecord, WalWriter};
+pub use wal::{WAL_FORMAT_VERSION, WAL_POSTCARD_VERSION};
 
 #[cfg(feature = "failpoints")]
 pub use fail::FailScenario;
@@ -168,3 +181,7 @@ pub fn cfg_failpoint(name: &str, actions: &str) -> std::result::Result<(), Strin
 pub fn remove_failpoint(name: &str) {
     fail::remove(name);
 }
+
+/// Testing utilities for failpoint-based chaos and resilience testing.
+#[cfg(feature = "failpoints")]
+pub mod testing;
